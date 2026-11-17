@@ -79,6 +79,17 @@ ctest --test-dir build --output-on-failure
 ./build/tensorc_autograd
 ```
 
+## Ejemplo Fahrenheit a Celsius
+
+`examples/fahrenheit.c` y `examples/fahrenheit.py` entrenan la misma red lineal con 2,049 muestras normalizadas, 500 épocas, minibatches de 64, la misma inicialización y la misma tasa de aprendizaje. Ambos imprimen el tiempo de entrenamiento y convierten 100 °F:
+
+```sh
+./build/tensorc_fahrenheit
+python3 examples/fahrenheit.py
+```
+
+El tiempo de C mide el entrenamiento dentro del proceso; el de Python usa `perf_counter()` para el mismo bucle de entrenamiento. Para comparar de forma estable, ejecuta cada programa varias veces y usa la mediana.
+
 ## Usarlo desde otro proyecto CMake
 
 Después de instalar TensorC, agrega el directorio de instalación a `CMAKE_PREFIX_PATH`, enlaza `TensorC::tensorc` e incluye `<tensorc/tensorc.h>`.

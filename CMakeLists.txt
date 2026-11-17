@@ -31,6 +31,8 @@ if(TENSORC_BUILD_EXAMPLES)
     target_link_libraries(tensorc_xor_adam PRIVATE TensorC::tensorc)
     add_executable(tensorc_autograd examples/autograd.c)
     target_link_libraries(tensorc_autograd PRIVATE TensorC::tensorc)
+    add_executable(tensorc_fahrenheit examples/fahrenheit.c)
+    target_link_libraries(tensorc_fahrenheit PRIVATE TensorC::tensorc)
 endif()
 
 include(CTest)

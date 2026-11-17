@@ -26,9 +26,15 @@ jobs:
       - name: Run autodiff example
         run: ./build/tensorc_autograd
         if: runner.os != 'Windows'
+      - name: Run Fahrenheit example
+        run: ./build/tensorc_fahrenheit
+        if: runner.os != 'Windows'
       - name: Run XOR example (Windows)
         run: .\build\Release\tensorc_xor.exe
         if: runner.os == 'Windows'
       - name: Run autodiff example (Windows)
         run: .\build\Release\tensorc_autograd.exe
+        if: runner.os == 'Windows'
+      - name: Run Fahrenheit example (Windows)
+        run: .\build\Release\tensorc_fahrenheit.exe
         if: runner.os == 'Windows'

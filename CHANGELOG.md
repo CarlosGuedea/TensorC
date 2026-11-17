@@ -7,6 +7,7 @@
 - Operaciones `add`, producto elemento a elemento, `matmul` 2D, ReLU, suma y MSE.
 - Grafo de operaciones con conteo de referencias y autodiferenciación hacia atrás.
 - Ejemplo `tensorc_autograd` y prueba CTest de gradientes.
+- Ejemplo equivalente C/Python de conversión Fahrenheit a Celsius con minibatches.
 - Se conserva la API 2D anterior (`tc_tensor`, modelos densos, SGD y Adam).
 
 ## 0.1.0 — primera versión pública en preparación

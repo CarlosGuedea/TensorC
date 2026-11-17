@@ -1,59 +1,174 @@
-# tensorc (Python)
+# tensorc
 
-Bindings de Python para [TensorC](../README.md): el núcleo numérico es la
-biblioteca en C11 (autograd, tensores N-dimensionales, Conv2D con
-stride/padding, max pooling, softmax/cross-entropy, SGD y Adam); este
-paquete solo expone esa funcionalidad a Python mediante una extensión
-CPython escrita en C.
-
-## Uso
+Framework de redes neuronales escrito en **C11** con autodiferenciación,
+invocable desde Python. El núcleo numérico es una biblioteca C pura
+(sin dependencias externas; en macOS usa Apple Accelerate) y este paquete
+es una extensión CPython escrita en C que la expone: **sin C++, sin
+ctypes, sin overhead de FFI genérico**.
 
 ```python
 import tensorc
 
 x = tensorc.Tensor([1, 2, 3, 4], shape=(2, 2), requires_grad=True)
-w = tensorc.Tensor([1.0, 0.0, 0.0, 1.0], shape=(2, 2), requires_grad=True)
+w = tensorc.Tensor([1, 0, 0, 1], shape=(2, 2), requires_grad=True)
 loss = x.matmul(w).relu().sum()
 loss.backward()
 x.sgd_step(0.01)
-
-capa = tensorc.Conv2DLayer(1, 8, 3, 3, stride=(1, 1), padding=(1, 1), seed=42)
-features = capa.forward(imagen)  # conv + sesgo, con autograd
 ```
 
-## Compilar e instalar en local
-
-Requisitos: Python 3.9+ con cabeceras de desarrollo (`python3-dev` en
-Linux, Python de Homebrew en macOS ya las incluye).
+## Instalación
 
 ```sh
+pip install tensorc
+```
+
+Ruedas precompiladas (no requieren compilador) para **CPython 3.9–3.13**
+en macOS (Intel y Apple Silicon), Linux (x86_64 y aarch64) y Windows
+(AMD64). En cualquier otra plataforma pip compila desde el código fuente
+automáticamente; solo necesitas un compilador C11.
+
+## Qué incluye
+
+- **Tensores N-dimensionales con autograd**: suma, multiplicación
+  elemento a elemento con broadcasting, matmul 2D, ReLU, sigmoid, tanh,
+  softmax, suma, reshape, slice en eje, concat N-aria, transposición 2D,
+  permutación general de ejes, layer norm (sobre la última dimensión) y
+  max pooling 2D, todas con gradientes analíticos.
+- **Pérdidas y optimizadores**: MSE, cross-entropy (gradiente
+  `(p − t) / filas`), SGD por paso y Adam sobre listas de parámetros.
+- **Convolución 2D** con stride y padding configurables; formatos
+  `[N, C, H, W]` × kernel `[K, C, KH, KW]`; ruta im2col+GEMM (Accelerate)
+  para convoluciones grandes.
+- **Capas de alto nivel entrenables**: `DenseLayer`, `Conv2DLayer`,
+  `LSTMLayer` (secuencias time-major `[seq, batch, in]`) y
+  `TransformerBlock` (atención multi-cabeza + conexiones residuales +
+  FFN, pre-norm).
+- **Atención**: single-head (`Tensor.attention`, con máscara causal
+  opcional) y multi-cabeza (`Tensor.multihead_attention`), más
+  codificación posicional sinusoidal (`sinusoidal_positions`).
+
+Cada operación valida formas incompatibles y reporta el error como
+excepción de Python.
+
+## Ejemplos
+
+### Regresión lineal
+
+```python
+import tensorc
+
+x = tensorc.Tensor([[1.0], [2.0], [3.0], [4.0]])
+y = tensorc.Tensor([[2.0], [4.0], [6.0], [8.0]])
+
+w = tensorc.Tensor([[0.1]], requires_grad=True)
+b = tensorc.Tensor([[0.0]], requires_grad=True)
+adam = tensorc.Adam([w, b], 0.05)
+
+for _ in range(200):
+    loss = x.matmul(w).add(b).mse_loss(y)
+    loss.backward()
+    adam.step()
+```
+
+### Convolución
+
+```python
+import tensorc
+
+conv = tensorc.Conv2DLayer(in_channels=3, out_channels=16, kernel_h=3,
+                           kernel_w=3, stride=(1, 1), padding=(1, 1),
+                           seed=42)
+imagen = tensorc.Tensor(datos_nchw)      # [N, 3, H, W]
+features = conv.forward(imagen)          # conv + sesgo, con autograd
+```
+
+### LSTM sobre una secuencia
+
+```python
+import tensorc
+
+lstm = tensorc.LSTMLayer(in_features=8, hidden=16, seed=7)
+out = lstm.forward(tensorc.Tensor(datos))   # [seq, batch, in] -> [seq, batch, 16]
+```
+
+### Bloque Transformer
+
+```python
+import tensorc
+
+bloque = tensorc.TransformerBlock(model_dim=64, ff_dim=128, heads=4, seed=1)
+x = tensorc.Tensor(lote).add(tensorc.sinusoidal_positions(seq, 64))  # broadcast
+y = bloque.forward(x)                    # [batch, seq, 64]
+opt = tensorc.Adam(bloque.params, 0.001) # los 8 parámetros del bloque
+```
+
+## Crear tensores
+
+```python
+tensorc.Tensor([1, 2, 3, 4], shape=(2, 2))          # desde lista
+tensorc.Tensor(numpy_array)                          # desde NumPy (float32/float64)
+tensorc.Tensor.zeros((2, 3), requires_grad=True)     # en cero
+```
+
+El constructor acepta cualquier objeto con el protocolo de buffer de
+Python (NumPy 1.x y 2.x, `array`, memoria contigua): float32 se copia
+directo, float64 se convierte, y la shape se infiere del buffer si no
+se pasa.
+
+## Correctitud y validación
+
+Los gradientes de todas las operaciones se validan por **diferencias
+finitas** en la suite de pruebas del núcleo C (10/10 pruebas en los
+backends Accelerate y genérico, sin fugas de memoria detectadas, ASan
+limpio), y los bindings se verifican contra referencias NumPy con los
+mismos datos y dimensiones.
+
+## Rendimiento
+
+En macOS, las multiplicaciones de matrices grandes y la ruta im2col de
+convolución usan Apple Accelerate (BLAS); el backend genérico en C puro
+sirve para cualquier otra plataforma. Las mediciones de referencia del
+repositorio comparan contra implementaciones equivalentes en NumPy con
+los mismos datos y dimensiones (ver `benchmarks/` en GitHub).
+
+## Compilar desde el código fuente
+
+Requisitos: Python 3.9+ con cabeceras de desarrollo (`python3-dev` en
+Linux; el Python de Homebrew en macOS ya las incluye).
+
+```sh
+git clone https://github.com/CarlosGuedea/TensorC.git
+cd TensorC
 python3 -m pip install ./python
 ```
 
-## Publicar en PyPI
+## Proceso de release (maintainers)
 
-1. Genera una distribución de código fuente y, si puedes, ruedas
-   precompiladas con [cibuildwheel](https://cibuildwheel.readthedocs.io/)
-   para macOS/Linux/Windows:
+El repositorio incluye un flujo de GitHub Actions
+(`.github/workflows/wheels.yml`) que, al crear un tag `v*`, construye el
+sdist y las ruedas multiplataforma, ejecuta una prueba de humo en cada
+rueda y publica todo en PyPI automáticamente. Para publicar una versión:
 
-   ```sh
-   python3 -m pip install build cibuildwheel twine
-   cd python
-   python3 -m build          # sdist + wheel de la plataforma actual
-   ```
+```sh
+# 1. Actualiza la versión en CMakeLists.txt, include/tensorc/tensorc.h,
+#    python/pyproject.toml y python/tensorc/__init__.py
+# 2. Ejecuta bash python/sync_core.sh tras cambiar el núcleo C
+# 3. Etiqueta y sube:
+git tag v0.14.0 && git push origin v0.14.0
+```
 
-2. Sube el paquete (necesitas cuenta en PyPI y un token):
+Para subir a mano (necesitas un token de PyPI):
 
-   ```sh
-   python3 -m twine upload dist/*
-   ```
+```sh
+cd python
+python3 -m pip install build twine
+python3 -m build
+python3 -m twine upload dist/*
+```
 
-Después cualquiera puede instalarlo con `pip install tensorc`.
+## Enlaces
 
-## Diseño
+- Repositorio y documentación completa: <https://github.com/CarlosGuedea/TensorC>
+- Reporte de issues: <https://github.com/CarlosGuedea/TensorC/issues>
 
-- `tensorc/_tensorc.c` — extensión CPython (C11). Convierte entre objetos
-  Python y `tc_tensor_nd`; no contiene matemáticas.
-- `minitf.c` / `ndtensor.c` — el núcleo en C, idéntico al que usa CMake.
-- En macOS se enlaza Apple Accelerate con la misma ruta im2col+GEMM que el
-  build de CMake; en Linux/Windows se usa el backend genérico.
+Licencia: Apache-2.0.

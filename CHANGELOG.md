@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.1 — documentación del paquete
+
+- README del paquete Python (`python/README.md`) reescrito por completo: instalación con `pip install tensorc`, features (regresión, Conv2D, LSTM, atención, bloque Transformer), ejemplos de uso, creación de tensores, validación de gradientes, rendimiento, build desde fuente y proceso de release con cibuildwheel.
+- Sin cambios de código. El único propósito de esta release es publicar la documentación actualizada en PyPI y validar de punta a punta el flujo de ruedas multiplataforma (macOS × 2, Windows, Linux × 2, CPython 3.9–3.13).
+
 ## 0.13.0 — bloque Transformer: atención multi-cabeza y permute
 
 - Nueva operación de grafo `tc_tensor_nd_permute`: permutación general de ejes (`out[i] = in[axes[i]]` por dimensión), con gradiente por el mapeo inverso validado por diferencias finitas.

@@ -1,0 +1,5 @@
+# The vendored C core must ship inside the sdist so the wheel can be
+# built from it on any machine (pip builds wheels from the sdist).
+recursive-include tensorc/core *.c *.h
+include README.md
+include sync_core.sh

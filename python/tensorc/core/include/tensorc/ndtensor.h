@@ -90,6 +90,14 @@ tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
  */
 tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
                                      size_t pool_h, size_t pool_w);
+/*
+ * Non-overlapping average pooling over the spatial axes of a [N,C,H,W]
+ * tensor. Same shape contract as maxpool2d: the output is
+ * [N, C, H/pool_h, W/pool_w] and the backward divides the upstream gradient
+ * evenly among the window's elements.
+ */
+tc_tensor_nd *tc_tensor_nd_avgpool2d(const tc_tensor_nd *input,
+                                     size_t pool_h, size_t pool_w);
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input);
 tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
                                     const tc_tensor_nd *target);

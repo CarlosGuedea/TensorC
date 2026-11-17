@@ -48,6 +48,15 @@ static float maxpool_loss(tc_tensor_nd *x) {
     return value;
 }
 
+static float avgpool_loss(tc_tensor_nd *x) {
+    tc_tensor_nd *out = tc_tensor_nd_avgpool2d(x, 2, 2);
+    tc_tensor_nd *loss = tc_tensor_nd_sum(out);
+    const float value = loss ? tc_tensor_nd_const_data(loss)[0] : NAN;
+    tc_tensor_nd_free(loss);
+    tc_tensor_nd_free(out);
+    return value;
+}
+
 static int test_reshape(void) {
     const size_t shape[] = {2, 2};
     const size_t flat[] = {4, 1};
@@ -214,12 +223,63 @@ static int test_layer(void) {
     return ok;
 }
 
+static int test_avgpool(void) {
+    /* Valores conocidos: promedio de cada ventana 2x2. */
+    const size_t shape[] = {1, 1, 4, 4};
+    const float values[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const float expected[] = {3.5f, 5.5f, 11.5f, 13.5f};
+    tc_tensor_nd *x = tc_tensor_nd_from_data(shape, 4, values, 1);
+    tc_tensor_nd *out = tc_tensor_nd_avgpool2d(x, 2, 2);
+    int ok = x && out && tc_tensor_nd_ndim(out) == 4 &&
+             tc_tensor_nd_shape(out)[2] == 2 && tc_tensor_nd_shape(out)[3] == 2;
+    const float *data = tc_tensor_nd_const_data(out);
+    for (size_t i = 0; ok && i < 4; ++i)
+        ok = close_enough(data[i], expected[i]);
+
+    /* Gradiente: se reparte en partes iguales entre los 4 elementos de cada
+     * ventana, así que con loss = sum(out) cada entrada vale 1/4. */
+    tc_tensor_nd *loss = tc_tensor_nd_sum(out);
+    ok = ok && loss && tc_tensor_nd_backward(loss);
+    const float *grad = tc_tensor_nd_grad(x);
+    for (size_t i = 0; ok && i < 16; ++i)
+        ok = close_enough(grad[i], 0.25f);
+    ok = ok && finite_difference(x, avgpool_loss, grad);
+
+    /* Datos con decimales y varios canales para el chequeo numérico. */
+    const size_t shape2[] = {1, 2, 4, 4};
+    float values2[1 * 2 * 4 * 4];
+    for (size_t i = 0; i < sizeof(values2) / sizeof(values2[0]); ++i)
+        values2[i] = (float)((int)(i * 41 % 31) - 15) * 0.17f;
+    tc_tensor_nd *x2 = tc_tensor_nd_from_data(shape2, 4, values2, 1);
+    tc_tensor_nd *out2 = tc_tensor_nd_avgpool2d(x2, 2, 2);
+    tc_tensor_nd *loss2 = tc_tensor_nd_sum(out2);
+    ok = ok && x2 && out2 && loss2 && tc_tensor_nd_backward(loss2);
+    ok = ok && finite_difference(x2, avgpool_loss, tc_tensor_nd_grad(x2));
+
+    /* Rechazos: pool 0 y dimensiones no divisibles. */
+    tc_tensor_nd *bad_pool = tc_tensor_nd_avgpool2d(x, 0, 2);
+    tc_tensor_nd *bad_size = tc_tensor_nd_avgpool2d(x, 3, 2);
+    ok = ok && !bad_pool && !bad_size;
+
+    tc_tensor_nd_free(bad_size);
+    tc_tensor_nd_free(bad_pool);
+    tc_tensor_nd_free(loss2);
+    tc_tensor_nd_free(out2);
+    tc_tensor_nd_free(x2);
+    tc_tensor_nd_free(loss);
+    tc_tensor_nd_free(out);
+    tc_tensor_nd_free(x);
+    return ok;
+}
+
 int main(void) {
     const int reshape_ok = test_reshape();
     const int maxpool_ok = test_maxpool();
+    const int avgpool_ok = test_avgpool();
     const int layer_ok = test_layer();
     printf("reshape: %s\n", reshape_ok ? "ok" : "error");
     printf("maxpool: %s\n", maxpool_ok ? "ok" : "error");
+    printf("avgpool: %s\n", avgpool_ok ? "ok" : "error");
     printf("layer: %s\n", layer_ok ? "ok" : "error");
-    return (reshape_ok && maxpool_ok && layer_ok) ? 0 : 1;
+    return (reshape_ok && maxpool_ok && avgpool_ok && layer_ok) ? 0 : 1;
 }

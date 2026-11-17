@@ -308,6 +308,13 @@ static PyObject *tensor_maxpool2d(TensorObject *self, PyObject *args) {
         tc_tensor_nd_maxpool2d(self->tensor, pool_h, pool_w));
 }
 
+static PyObject *tensor_avgpool2d(TensorObject *self, PyObject *args) {
+    size_t pool_h, pool_w;
+    if (!PyArg_ParseTuple(args, "nn", &pool_h, &pool_w)) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_tensor_nd_avgpool2d(self->tensor, pool_h, pool_w));
+}
+
 static PyObject *tensor_reshape(TensorObject *self, PyObject *args) {
     PyObject *shape_obj;
     if (!PyArg_ParseTuple(args, "O", &shape_obj)) return NULL;
@@ -491,6 +498,8 @@ static PyMethodDef tensor_methods[] = {
      "Mean cross-entropy over rows."},
     {"maxpool2d", (PyCFunction)tensor_maxpool2d, METH_VARARGS,
      "maxpool2d(pool_h, pool_w)"},
+    {"avgpool2d", (PyCFunction)tensor_avgpool2d, METH_VARARGS,
+     "avgpool2d(pool_h, pool_w)"},
     {"reshape", (PyCFunction)tensor_reshape, METH_VARARGS, "reshape(shape)"},
     {"conv2d", (PyCFunction)tensor_conv2d, METH_VARARGS | METH_KEYWORDS,
      "conv2d(kernel, stride=(1,1), padding=(0,0))"},

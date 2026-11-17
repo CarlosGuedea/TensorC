@@ -21,6 +21,7 @@ typedef enum {
     TC_ND_OP_MSE,
     TC_ND_OP_RESHAPE,
     TC_ND_OP_MAXPOOL2D,
+    TC_ND_OP_AVGPOOL2D,
     TC_ND_OP_SOFTMAX,
     TC_ND_OP_CROSS_ENTROPY,
     TC_ND_OP_SIGMOID,
@@ -628,6 +629,44 @@ tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
     return result;
 }
 
+tc_tensor_nd *tc_tensor_nd_avgpool2d(const tc_tensor_nd *input,
+                                     size_t pool_h, size_t pool_w) {
+    if (!input || input->ndim != 4 || pool_h == 0 || pool_w == 0 ||
+        input->shape[2] % pool_h != 0 || input->shape[3] % pool_w != 0)
+        return NULL;
+    const size_t output_shape[] = {
+        input->shape[0], input->shape[1],
+        input->shape[2] / pool_h, input->shape[3] / pool_w
+    };
+    tc_tensor_nd *result = unary_result(output_shape, 4, TC_ND_OP_AVGPOOL2D,
+                                            input);
+    if (!result) return NULL;
+
+    const size_t batch = input->shape[0];
+    const size_t channels = input->shape[1];
+    const size_t input_height = input->shape[2];
+    const size_t input_width = input->shape[3];
+    const size_t output_height = result->shape[2];
+    const size_t output_width = result->shape[3];
+    const float window = (float)(pool_h * pool_w);
+    for (size_t n = 0; n < batch; ++n)
+        for (size_t c = 0; c < channels; ++c)
+            for (size_t oh = 0; oh < output_height; ++oh)
+                for (size_t ow = 0; ow < output_width; ++ow) {
+                    float sum = 0.0f;
+                    const size_t row0 = oh * pool_h;
+                    const size_t col0 = ow * pool_w;
+                    for (size_t ph = 0; ph < pool_h; ++ph)
+                        for (size_t pw = 0; pw < pool_w; ++pw)
+                            sum += input->data[
+                                (((n * channels + c) * input_height + row0 + ph) *
+                                 input_width + col0 + pw)];
+                    result->data[(((n * channels + c) * output_height + oh) *
+                                  output_width + ow)] = sum / window;
+                }
+    return result;
+}
+
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input) {
     if (!input) return NULL;
     const size_t shape[] = {1};
@@ -1165,6 +1204,34 @@ static void backward_node(tc_tensor_nd *tensor) {
                             add_grad(a, best_index,
                                      tensor->grad[(((n * channels + c) * output_height + oh) *
                                                    output_width + ow)]);
+                        }
+            break;
+        }
+        case TC_ND_OP_AVGPOOL2D: {
+            const size_t pool_h = a->shape[2] / tensor->shape[2];
+            const size_t pool_w = a->shape[3] / tensor->shape[3];
+            const size_t batch = a->shape[0];
+            const size_t channels = a->shape[1];
+            const size_t input_height = a->shape[2];
+            const size_t input_width = a->shape[3];
+            const size_t output_height = tensor->shape[2];
+            const size_t output_width = tensor->shape[3];
+            const float share = 1.0f / (float)(pool_h * pool_w);
+            for (size_t n = 0; n < batch; ++n)
+                for (size_t c = 0; c < channels; ++c)
+                    for (size_t oh = 0; oh < output_height; ++oh)
+                        for (size_t ow = 0; ow < output_width; ++ow) {
+                            const size_t row0 = oh * pool_h;
+                            const size_t col0 = ow * pool_w;
+                            const float upstream =
+                                tensor->grad[(((n * channels + c) * output_height + oh) *
+                                              output_width + ow)] * share;
+                            for (size_t ph = 0; ph < pool_h; ++ph)
+                                for (size_t pw = 0; pw < pool_w; ++pw)
+                                    add_grad(a,
+                                             (((n * channels + c) * input_height + row0 + ph) *
+                                              input_width + col0 + pw),
+                                             upstream);
                         }
             break;
         }

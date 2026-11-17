@@ -2,7 +2,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.6 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D válida, ReLU, suma y pérdida MSE. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y conserva un backend genérico para otras plataformas. Todavía no incluye GPU ni importación de modelos de TensorFlow.
+La versión 0.7 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, ReLU, suma y pérdida MSE. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. Todavía no incluye GPU ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -100,13 +100,33 @@ El archivo incluye una firma y una versión de formato para rechazar archivos in
 
 ## Convolución 2D
 
-La API incluye correlación 2D válida en CPU con tensores en formato `[lote, canales, alto, ancho]` y kernels `[filtros, canales, alto_kernel, ancho_kernel]`:
+La API incluye correlación 2D en CPU con tensores en formato `[lote, canales, alto, ancho]` y kernels `[filtros, canales, alto_kernel, ancho_kernel]`:
 
 ```c
 tc_tensor_nd *features = tc_tensor_nd_conv2d(input, kernel);
+
+/* Con stride y padding configurables: */
+tc_conv2d_options options = {2, 2, 1, 1}; /* stride_h, stride_w, pad_h, pad_w */
+tc_tensor_nd *strided = tc_tensor_nd_conv2d_ex(input, kernel, options);
 ```
 
-La operación conserva el grafo de autodiferenciación y calcula gradientes para la entrada y el kernel. El sesgo puede agregarse como un tensor `[1, filtros, 1, 1]` usando broadcasting.
+`tc_tensor_nd_conv2d` equivale a `tc_tensor_nd_conv2d_ex` con `TC_CONV2D_DEFAULT` (stride 1, sin padding). El padding es simétrico y de ceros; la forma de salida es `[N, K, (H + 2·pad_h − KH)/stride_h + 1, (W + 2·pad_w − KW)/stride_w + 1]`. La operación conserva el grafo de autodiferenciación y calcula gradientes para la entrada y el kernel. El sesgo puede agregarse como un tensor `[1, filtros, 1, 1]` usando broadcasting.
+
+En macOS, las convoluciones grandes usan una ruta im2col + `cblas_sgemm` de Accelerate; los tamaños pequeños y el backend genérico conservan el bucle directo. El benchmark compara contra una implementación equivalente en Python/NumPy con los mismos datos y dimensiones:
+
+```sh
+cmake --build build --target tensorc_conv2d_benchmark
+python3 benchmarks/conv2d/conv2d_numpy.py
+```
+
+En una medición de referencia con entrada `[8,3,32,32]`, kernel `[16,3,3,3]`, stride 1 y padding 1 (medianas: NumPy con 7 repeticiones, C con 200), los resultados fueron:
+
+| Implementación | Forward (mediana) | Backward (mediana) |
+|---|---:|---:|
+| Python/NumPy (bucles directos) | 321.1 ms | n/d |
+| TensorC con Accelerate | 0.384 ms | 0.612 ms |
+
+La salida de C coincidió con NumPy con un error máximo de `4.8e-06`. Los tiempos pueden variar según el equipo.
 
 ## Ejemplo Fahrenheit a Celsius
 
@@ -163,7 +183,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.4: broadcasting en operaciones elemento a elemento y acumulación correcta de gradientes.
 - 0.5: serialización binaria versionada de modelos densos.
 - 0.6: convolución 2D válida con gradientes para entrada y kernels.
-- Siguientes pasos: padding/stride configurables, capas convolucionales completas y GPU.
+- 0.7: stride y padding configurables en Conv2D, ruta im2col+GEMM para convoluciones grandes en Accelerate, y benchmark reproducible contra NumPy.
+- Siguientes pasos: capas convolucionales completas (agrupamiento, apilamiento de capas) y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

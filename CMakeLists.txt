@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.6.0 LANGUAGES C)
+project(TensorC VERSION 0.7.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
+option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
 option(TENSORC_USE_ACCELERATE "Use Apple Accelerate for large matrix operations" ON)
 
 add_library(tensorc minitf.c ndtensor.c)
@@ -45,6 +46,11 @@ if(TENSORC_BUILD_EXAMPLES)
     target_link_libraries(tensorc_fahrenheit PRIVATE TensorC::tensorc)
     add_executable(tensorc_matmul_benchmark examples/matmul_benchmark.c)
     target_link_libraries(tensorc_matmul_benchmark PRIVATE TensorC::tensorc)
+endif()
+
+if(TENSORC_BUILD_BENCHMARKS)
+    add_executable(tensorc_conv2d_benchmark benchmarks/conv2d/conv2d_benchmark.c)
+    target_link_libraries(tensorc_conv2d_benchmark PRIVATE TensorC::tensorc)
 endif()
 
 include(CTest)

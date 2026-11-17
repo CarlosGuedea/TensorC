@@ -5,6 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TENSORC_HAS_ACCELERATE
+#include <limits.h>
+#include <Accelerate/Accelerate.h>
+#endif
+
 typedef enum {
     TC_ND_OP_LEAF = 0,
     TC_ND_OP_ADD,
@@ -26,6 +31,7 @@ struct tc_tensor_nd {
     unsigned int refcount;
     int requires_grad;
     tc_nd_op op;
+    tc_conv2d_options conv_options;
     size_t parent_count;
     tc_tensor_nd *parents[2];
 };
@@ -269,23 +275,47 @@ tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) 
     return result;
 }
 
-tc_tensor_nd *tc_tensor_nd_conv2d(const tc_tensor_nd *input,
-                                   const tc_tensor_nd *kernel) {
-    if (!input || !kernel || input->ndim != 4 || kernel->ndim != 4 ||
-        input->shape[1] != kernel->shape[1] ||
-        input->shape[2] < kernel->shape[2] || input->shape[3] < kernel->shape[3])
-        return NULL;
+#ifdef TENSORC_HAS_ACCELERATE
+/*
+ * Builds the im2col matrix for one image: row (oh,ow) holds the flattened
+ * window [C*KH*KW] with zero padding. Layout: col[(oh*ow + ow) * cols + k].
+ */
+static void conv2d_build_col_image(const tc_tensor_nd *input,
+                                   tc_conv2d_options options, size_t n,
+                                   size_t output_height, size_t output_width,
+                                   size_t kernel_height, size_t kernel_width,
+                                   float *col) {
+    const size_t input_channels = input->shape[1];
+    const size_t input_height = input->shape[2];
+    const size_t input_width = input->shape[3];
+    const size_t cols = input_channels * kernel_height * kernel_width;
+    for (size_t oh = 0; oh < output_height; ++oh)
+        for (size_t ow = 0; ow < output_width; ++ow) {
+            float *row = col + (oh * output_width + ow) * cols;
+            for (size_t ic = 0; ic < input_channels; ++ic)
+                for (size_t kh = 0; kh < kernel_height; ++kh) {
+                    const size_t input_row = oh * options.stride_h + kh;
+                    const int row_valid = input_row >= options.pad_h &&
+                                          input_row < input_height + options.pad_h;
+                    for (size_t kw = 0; kw < kernel_width; ++kw) {
+                        const size_t input_col = ow * options.stride_w + kw;
+                        row[(ic * kernel_height + kh) * kernel_width + kw] =
+                            (row_valid && input_col >= options.pad_w &&
+                             input_col < input_width + options.pad_w)
+                            ? input->data[((n * input_channels + ic) * input_height +
+                                           input_row - options.pad_h) * input_width +
+                                          input_col - options.pad_w]
+                            : 0.0f;
+                    }
+                }
+        }
+}
+#endif
 
-    const size_t output_shape[] = {
-        input->shape[0], kernel->shape[0],
-        input->shape[2] - kernel->shape[2] + 1,
-        input->shape[3] - kernel->shape[3] + 1
-    };
-    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_CONV2D,
-                                            (tc_tensor_nd *)input,
-                                            (tc_tensor_nd *)kernel);
-    if (!result) return NULL;
-
+static void conv2d_forward_naive(const tc_tensor_nd *input,
+                                 const tc_tensor_nd *kernel,
+                                 tc_conv2d_options options,
+                                 tc_tensor_nd *result) {
     const size_t batch = input->shape[0];
     const size_t input_channels = input->shape[1];
     const size_t input_height = input->shape[2];
@@ -298,24 +328,121 @@ tc_tensor_nd *tc_tensor_nd_conv2d(const tc_tensor_nd *input,
 
     for (size_t n = 0; n < batch; ++n)
         for (size_t oc = 0; oc < output_channels; ++oc)
-            for (size_t oh = 0; oh < output_height; ++oh)
+            for (size_t oh = 0; oh < output_height; ++oh) {
+                const size_t row_offset = oh * options.stride_h;
                 for (size_t ow = 0; ow < output_width; ++ow) {
+                    const size_t col_offset = ow * options.stride_w;
                     float value = 0.0f;
                     for (size_t ic = 0; ic < input_channels; ++ic)
-                        for (size_t kh = 0; kh < kernel_height; ++kh)
+                        for (size_t kh = 0; kh < kernel_height; ++kh) {
+                            const size_t input_row = row_offset + kh;
+                            if (input_row < options.pad_h ||
+                                input_row >= input_height + options.pad_h)
+                                continue;
                             for (size_t kw = 0; kw < kernel_width; ++kw) {
+                                const size_t input_col = col_offset + kw;
+                                if (input_col < options.pad_w ||
+                                    input_col >= input_width + options.pad_w)
+                                    continue;
                                 const size_t input_index =
-                                    (((n * input_channels + ic) * input_height + oh + kh) *
-                                     input_width + ow + kw);
+                                    (((n * input_channels + ic) * input_height +
+                                      input_row - options.pad_h) *
+                                     input_width + input_col - options.pad_w);
                                 const size_t kernel_index =
                                     (((oc * input_channels + ic) * kernel_height + kh) *
                                      kernel_width + kw);
-                                value += input->data[input_index] * kernel->data[kernel_index];
+                                value += input->data[input_index] *
+                                         kernel->data[kernel_index];
                             }
+                        }
                     const size_t output_index =
                         (((n * output_channels + oc) * output_height + oh) * output_width + ow);
                     result->data[output_index] = value;
                 }
+            }
+}
+
+#ifdef TENSORC_HAS_ACCELERATE
+/*
+ * Ruta rápida: im2col + GEMM de Accelerate, una imagen a la vez. La salida
+ * del GEMM cae directamente en el layout [N, K, OH, OW] de cada imagen.
+ * Devuelve 1 si procesó la convolución; 0 pide el camino genérico.
+ */
+static int conv2d_accelerate_forward(const tc_tensor_nd *input,
+                                     const tc_tensor_nd *kernel,
+                                     tc_conv2d_options options,
+                                     tc_tensor_nd *result) {
+    const size_t batch = input->shape[0];
+    const size_t input_channels = input->shape[1];
+    const size_t kernel_height = kernel->shape[2];
+    const size_t kernel_width = kernel->shape[3];
+    const size_t output_channels = kernel->shape[0];
+    const size_t output_height = result->shape[2];
+    const size_t output_width = result->shape[3];
+    const size_t rows = output_height * output_width;
+    const size_t depth = input_channels * kernel_height * kernel_width;
+
+    if (rows == 0 || depth == 0 || rows > (size_t)INT_MAX ||
+        depth > (size_t)INT_MAX || output_channels > (size_t)INT_MAX)
+        return 0;
+    const size_t output_size = batch * output_channels * rows;
+    if (output_size > ((size_t)-1) / depth ||
+        output_size * depth < ((size_t)1 << 16))
+        return 0;
+
+    float *col = (float *)malloc(rows * depth * sizeof(float));
+    if (!col) return 0;
+    for (size_t n = 0; n < batch; ++n) {
+        conv2d_build_col_image(input, options, n, output_height, output_width,
+                               kernel_height, kernel_width, col);
+        float *out_n = result->data + n * output_channels * rows;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)output_channels, (int)rows, (int)depth,
+                    1.0f, kernel->data, (int)depth,
+                    col, (int)depth,
+                    0.0f, out_n, (int)rows);
+    }
+    free(col);
+    return 1;
+}
+#endif
+
+tc_tensor_nd *tc_tensor_nd_conv2d(const tc_tensor_nd *input,
+                                   const tc_tensor_nd *kernel) {
+    return tc_tensor_nd_conv2d_ex(input, kernel, TC_CONV2D_DEFAULT);
+}
+
+tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
+                                     const tc_tensor_nd *kernel,
+                                     tc_conv2d_options options) {
+    if (!input || !kernel || input->ndim != 4 || kernel->ndim != 4 ||
+        input->shape[1] != kernel->shape[1] || options.stride_h == 0 ||
+        options.stride_w == 0 ||
+        options.pad_h > ((size_t)-1 - input->shape[2]) / 2 ||
+        options.pad_w > ((size_t)-1 - input->shape[3]) / 2)
+        return NULL;
+
+    const size_t padded_height = input->shape[2] + 2 * options.pad_h;
+    const size_t padded_width = input->shape[3] + 2 * options.pad_w;
+    if (kernel->shape[2] > padded_height || kernel->shape[3] > padded_width)
+        return NULL;
+
+    const size_t output_height = (padded_height - kernel->shape[2]) / options.stride_h + 1;
+    const size_t output_width = (padded_width - kernel->shape[3]) / options.stride_w + 1;
+    const size_t output_shape[] = {
+        input->shape[0], kernel->shape[0], output_height, output_width
+    };
+    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_CONV2D,
+                                            (tc_tensor_nd *)input,
+                                            (tc_tensor_nd *)kernel);
+    if (!result) return NULL;
+    result->conv_options = options;
+
+#ifdef TENSORC_HAS_ACCELERATE
+    if (conv2d_accelerate_forward(input, kernel, options, result))
+        return result;
+#endif
+    conv2d_forward_naive(input, kernel, options, result);
     return result;
 }
 
@@ -354,6 +481,103 @@ tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
     result->data[0] /= (float)prediction->size;
     return result;
 }
+
+#ifdef TENSORC_HAS_ACCELERATE
+/*
+ * Backward vía im2col + GEMM:
+ *   dW       = sum_n col_n^T @ dgrad_n   -> scatter al gradiente del kernel
+ *   dcol_n   = dgrad_n^T @ W             -> col2im al gradiente de la entrada
+ * Devuelve 1 si procesó el nodo; 0 pide el camino genérico.
+ */
+static int conv2d_accelerate_backward(tc_tensor_nd *input, tc_tensor_nd *kernel,
+                                      tc_tensor_nd *output_node) {
+    const tc_conv2d_options options = output_node->conv_options;
+    const size_t batch = input->shape[0];
+    const size_t input_channels = input->shape[1];
+    const size_t input_height = input->shape[2];
+    const size_t input_width = input->shape[3];
+    const size_t filters = kernel->shape[0];
+    const size_t kernel_height = kernel->shape[2];
+    const size_t kernel_width = kernel->shape[3];
+    const size_t output_height = output_node->shape[2];
+    const size_t output_width = output_node->shape[3];
+    const size_t rows = output_height * output_width;
+    const size_t depth = input_channels * kernel_height * kernel_width;
+
+    if (rows == 0 || depth == 0 || rows > (size_t)INT_MAX ||
+        depth > (size_t)INT_MAX || filters > (size_t)INT_MAX)
+        return 0;
+    const size_t output_size = batch * filters * rows;
+    if (output_size > ((size_t)-1) / depth ||
+        output_size * depth < ((size_t)1 << 16))
+        return 0;
+
+    float *col = (float *)malloc(rows * depth * sizeof(float));
+    float *dw = (float *)calloc(depth * filters, sizeof(float));
+    float *dcol = (float *)malloc(rows * depth * sizeof(float));
+    if (!col || !dw || !dcol) {
+        free(col);
+        free(dw);
+        free(dcol);
+        return 0;
+    }
+
+    for (size_t n = 0; n < batch; ++n) {
+        const float *dgrad_n = output_node->grad + n * filters * rows;
+        conv2d_build_col_image(input, options, n, output_height, output_width,
+                               kernel_height, kernel_width, col);
+        /* dw += col_n^T @ dgrad_n, con dw [depth, filters]. */
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasTrans,
+                    (int)depth, (int)filters, (int)rows,
+                    1.0f, col, (int)depth,
+                    dgrad_n, (int)rows,
+                    n == 0 ? 0.0f : 1.0f, dw, (int)filters);
+        /* dcol_n [rows, depth] = dgrad_n^T @ W. */
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    (int)rows, (int)depth, (int)filters,
+                    1.0f, dgrad_n, (int)rows,
+                    kernel->data, (int)depth,
+                    0.0f, dcol, (int)depth);
+        /* col2im: dispersa dcol en el gradiente de la entrada. */
+        if (input->requires_grad && input->grad) {
+            for (size_t oh = 0; oh < output_height; ++oh) {
+                const size_t row_offset = oh * options.stride_h;
+                for (size_t ow = 0; ow < output_width; ++ow) {
+                    const size_t col_offset = ow * options.stride_w;
+                    const float *dcol_row = dcol + (oh * output_width + ow) * depth;
+                    for (size_t ic = 0; ic < input_channels; ++ic)
+                        for (size_t kh = 0; kh < kernel_height; ++kh) {
+                            const size_t input_row = row_offset + kh;
+                            if (input_row < options.pad_h ||
+                                input_row >= input_height + options.pad_h)
+                                continue;
+                            for (size_t kw = 0; kw < kernel_width; ++kw) {
+                                const size_t input_col = col_offset + kw;
+                                if (input_col < options.pad_w ||
+                                    input_col >= input_width + options.pad_w)
+                                    continue;
+                                input->grad[((n * input_channels + ic) * input_height +
+                                             input_row - options.pad_h) * input_width +
+                                            input_col - options.pad_w] +=
+                                    dcol_row[(ic * kernel_height + kh) * kernel_width + kw];
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    if (kernel->requires_grad && kernel->grad)
+        for (size_t f = 0; f < filters; ++f)
+            for (size_t k = 0; k < depth; ++k)
+                kernel->grad[f * depth + k] += dw[k * filters + f];
+
+    free(dcol);
+    free(dw);
+    free(col);
+    return 1;
+}
+#endif
 
 typedef struct {
     tc_tensor_nd **items;
@@ -430,6 +654,10 @@ static void backward_node(tc_tensor_nd *tensor) {
                 }
             break;
         case TC_ND_OP_CONV2D: {
+#ifdef TENSORC_HAS_ACCELERATE
+            if (conv2d_accelerate_backward(a, b, tensor)) break;
+#endif
+            const tc_conv2d_options options = tensor->conv_options;
             const size_t batch = a->shape[0];
             const size_t input_channels = a->shape[1];
             const size_t input_height = a->shape[2];
@@ -441,18 +669,29 @@ static void backward_node(tc_tensor_nd *tensor) {
             const size_t output_width = tensor->shape[3];
             for (size_t n = 0; n < batch; ++n)
                 for (size_t oc = 0; oc < output_channels; ++oc)
-                    for (size_t oh = 0; oh < output_height; ++oh)
+                    for (size_t oh = 0; oh < output_height; ++oh) {
+                        const size_t row_offset = oh * options.stride_h;
                         for (size_t ow = 0; ow < output_width; ++ow) {
+                            const size_t col_offset = ow * options.stride_w;
                             const size_t output_index =
                                 (((n * output_channels + oc) * output_height + oh) *
                                  output_width + ow);
                             const float output_gradient = tensor->grad[output_index];
                             for (size_t ic = 0; ic < input_channels; ++ic)
-                                for (size_t kh = 0; kh < kernel_height; ++kh)
+                                for (size_t kh = 0; kh < kernel_height; ++kh) {
+                                    const size_t input_row = row_offset + kh;
+                                    if (input_row < options.pad_h ||
+                                        input_row >= input_height + options.pad_h)
+                                        continue;
                                     for (size_t kw = 0; kw < kernel_width; ++kw) {
+                                        const size_t input_col = col_offset + kw;
+                                        if (input_col < options.pad_w ||
+                                            input_col >= input_width + options.pad_w)
+                                            continue;
                                         const size_t input_index =
-                                            (((n * input_channels + ic) * input_height + oh + kh) *
-                                             input_width + ow + kw);
+                                            (((n * input_channels + ic) * input_height +
+                                              input_row - options.pad_h) *
+                                             input_width + input_col - options.pad_w);
                                         const size_t kernel_index =
                                             (((oc * input_channels + ic) * kernel_height + kh) *
                                              kernel_width + kw);
@@ -461,7 +700,9 @@ static void backward_node(tc_tensor_nd *tensor) {
                                         add_grad(b, kernel_index,
                                                  output_gradient * a->data[input_index]);
                                     }
+                                }
                         }
+                    }
             break;
         }
         case TC_ND_OP_RELU:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 — Conv2D con stride y padding
+
+- Se agregó `tc_tensor_nd_conv2d_ex` con opciones de stride y padding simétrico de ceros (`tc_conv2d_options`); `tc_tensor_nd_conv2d` se conserva como stride 1 / sin padding.
+- Los gradientes automáticos de entrada y kernel respetan stride y padding.
+- Validación ampliada: stride en cero, kernel mayor que la entrada aun con padding, y desbordamiento en las dimensiones rellenadas.
+- Ruta im2col + GEMM (Accelerate) para convoluciones grandes, con umbral para conservar el bucle directo en tamaños pequeños y en el backend genérico.
+- Pruebas de valores conocidos con stride/padding, identidad de composición con varios canales y filtros, y diferencias finitas con tolerancia relativa al ruido de float32.
+- Benchmark reproducible `tensorc_conv2d_benchmark` + `benchmarks/conv2d/conv2d_numpy.py` con los mismos datos y dimensiones: en `[8,3,32,32]` × `[16,3,3,3]`, mediana de 0.384 ms (forward) frente a 321.1 ms de NumPy, con salida idéntica dentro de 4.8e-06.
+
 ## 0.6.0 — convolución 2D en CPU
 
 - Se agregó `tc_tensor_nd_conv2d` para entrada `[N,C,H,W]` y kernels `[K,C,KH,KW]`.

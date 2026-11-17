@@ -61,6 +61,9 @@ void mt_seed(unsigned int seed);
 MTModel mt_model_create(size_t input_size, const size_t *layer_sizes,
                         const MTActivation *activations, size_t layer_count);
 void mt_model_free(MTModel *model);
+/* Save/load the dense model parameters using TensorC's versioned binary format. */
+int mt_model_save(const MTModel *model, const char *path);
+MTModel mt_model_load(const char *path);
 MTOptimizer mt_optimizer_sgd(float learning_rate);
 MTOptimizer mt_optimizer_adam(const MTModel *model, float learning_rate);
 void mt_optimizer_free(MTOptimizer *optimizer);

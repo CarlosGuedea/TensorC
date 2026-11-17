@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define TENSORC_VERSION "0.4.0"
+#define TENSORC_VERSION "0.5.0"
 
 typedef MTTensor tc_tensor;
 typedef MTActivation tc_activation;
@@ -31,6 +31,8 @@ typedef MTOptimizer tc_optimizer;
 #define tc_tensor_print mt_tensor_print
 #define tc_model_create mt_model_create
 #define tc_model_free mt_model_free
+#define tc_model_save mt_model_save
+#define tc_model_load mt_model_load
 #define tc_optimizer_sgd mt_optimizer_sgd
 #define tc_optimizer_adam mt_optimizer_adam
 #define tc_optimizer_free mt_optimizer_free

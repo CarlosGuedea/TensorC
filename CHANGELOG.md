@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 — serialización de modelos densos
+
+- Se agregaron `tc_model_save` y `tc_model_load`.
+- El formato binario incluye firma, versión, arquitectura, activaciones, pesos y sesgos.
+- Se rechazan archivos incompletos, incompatibles o con dimensiones inválidas.
+- Se agregó una prueba CTest de guardado, carga y equivalencia de predicciones.
+
 ## 0.4.0 — broadcasting en tensores N-dimensionales
 
 - `add` y `mul` aceptan dimensiones compatibles alineadas a la derecha.

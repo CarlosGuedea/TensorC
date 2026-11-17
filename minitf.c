@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,6 +145,151 @@ void mt_model_free(MTModel *model) {
     free(model->layers);
     model->layers = NULL;
     model->layer_count = model->input_size = 0;
+}
+
+static const unsigned char model_magic[8] = {'T', 'C', 'M', 'O', 'D', 'E', 'L', '1'};
+#define MT_MODEL_FORMAT_VERSION 1u
+
+static int write_model_value(FILE *file, const void *value, size_t size) {
+    return file && value && fwrite(value, size, 1, file) == 1;
+}
+
+static int read_model_value(FILE *file, void *value, size_t size) {
+    return file && value && fread(value, size, 1, file) == 1;
+}
+
+static int size_to_u64(size_t value, uint64_t *result) {
+    if (!result || (uintmax_t)value > UINT64_MAX) return 0;
+    *result = (uint64_t)value;
+    return 1;
+}
+
+static int u64_to_size(uint64_t value, size_t *result) {
+    if (!result || value > (uint64_t)(size_t)-1) return 0;
+    *result = (size_t)value;
+    return 1;
+}
+
+int mt_model_save(const MTModel *model, const char *path) {
+    if (!model || !model->layers || model->input_size == 0 ||
+        model->layer_count == 0 || !path) return 0;
+
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+
+    const uint32_t version = MT_MODEL_FORMAT_VERSION;
+    uint64_t input_size = 0;
+    uint64_t layer_count = 0;
+    int ok = size_to_u64(model->input_size, &input_size) &&
+             size_to_u64(model->layer_count, &layer_count) &&
+             write_model_value(file, model_magic, sizeof(model_magic)) &&
+             write_model_value(file, &version, sizeof(version)) &&
+             write_model_value(file, &input_size, sizeof(input_size)) &&
+             write_model_value(file, &layer_count, sizeof(layer_count));
+
+    for (size_t l = 0; ok && l < model->layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        uint64_t layer_input = 0;
+        uint64_t layer_output = 0;
+        const uint32_t activation = (uint32_t)layer->activation;
+        ok = layer->weights && layer->biases &&
+             size_to_u64(layer->input_size, &layer_input) &&
+             size_to_u64(layer->output_size, &layer_output) &&
+             activation <= (uint32_t)MT_TANH &&
+             write_model_value(file, &layer_input, sizeof(layer_input)) &&
+             write_model_value(file, &layer_output, sizeof(layer_output)) &&
+             write_model_value(file, &activation, sizeof(activation));
+    }
+
+    for (size_t l = 0; ok && l < model->layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        ok = write_model_value(file, layer->weights,
+                               layer->input_size * layer->output_size * sizeof(float)) &&
+             write_model_value(file, layer->biases,
+                               layer->output_size * sizeof(float));
+    }
+
+    const int close_ok = fclose(file) == 0;
+    return ok && close_ok;
+}
+
+MTModel mt_model_load(const char *path) {
+    MTModel invalid = {0, 0, NULL};
+    if (!path) return invalid;
+
+    FILE *file = fopen(path, "rb");
+    if (!file) return invalid;
+
+    unsigned char magic[sizeof(model_magic)] = {0};
+    uint32_t version = 0;
+    uint64_t input_size64 = 0;
+    uint64_t layer_count64 = 0;
+    size_t input_size = 0;
+    size_t layer_count = 0;
+    size_t *layer_sizes = NULL;
+    MTActivation *activations = NULL;
+    MTModel model = {0, 0, NULL};
+    int ok = read_model_value(file, magic, sizeof(magic)) &&
+             memcmp(magic, model_magic, sizeof(model_magic)) == 0 &&
+             read_model_value(file, &version, sizeof(version)) &&
+             version == MT_MODEL_FORMAT_VERSION &&
+             read_model_value(file, &input_size64, sizeof(input_size64)) &&
+             read_model_value(file, &layer_count64, sizeof(layer_count64)) &&
+             u64_to_size(input_size64, &input_size) &&
+             u64_to_size(layer_count64, &layer_count) &&
+             input_size > 0 && layer_count > 0 &&
+             layer_count <= (size_t)-1 / sizeof(*layer_sizes);
+    if (!ok) goto fail;
+
+    layer_sizes = (size_t *)calloc(layer_count, sizeof(*layer_sizes));
+    activations = (MTActivation *)calloc(layer_count, sizeof(*activations));
+    if (!layer_sizes || !activations) goto fail;
+
+    size_t expected_input = input_size;
+    for (size_t l = 0; l < layer_count; ++l) {
+        uint64_t layer_input64 = 0;
+        uint64_t layer_output64 = 0;
+        uint32_t activation = 0;
+        size_t serialized_input = 0;
+        ok = read_model_value(file, &layer_input64, sizeof(layer_input64)) &&
+             read_model_value(file, &layer_output64, sizeof(layer_output64)) &&
+             read_model_value(file, &activation, sizeof(activation)) &&
+             u64_to_size(layer_input64, &serialized_input) &&
+             u64_to_size(layer_output64, &layer_sizes[l]) &&
+             serialized_input == expected_input && layer_sizes[l] > 0 &&
+             activation <= (uint32_t)MT_TANH;
+        if (!ok) goto fail;
+        activations[l] = (MTActivation)activation;
+        expected_input = layer_sizes[l];
+    }
+
+    {
+        const unsigned int saved_rng_state = rng_state;
+        model = mt_model_create(input_size, layer_sizes, activations, layer_count);
+        rng_state = saved_rng_state;
+    }
+    if (!model.layers) goto fail;
+
+    for (size_t l = 0; l < layer_count; ++l) {
+        MTLayer *layer = &model.layers[l];
+        ok = read_model_value(file, layer->weights,
+                              layer->input_size * layer->output_size * sizeof(float)) &&
+             read_model_value(file, layer->biases,
+                              layer->output_size * sizeof(float));
+        if (!ok) goto fail;
+    }
+
+    free(layer_sizes);
+    free(activations);
+    fclose(file);
+    return model;
+
+fail:
+    mt_model_free(&model);
+    free(layer_sizes);
+    free(activations);
+    fclose(file);
+    return invalid;
 }
 
 static int valid_input(const MTModel *model, const MTTensor *input) {

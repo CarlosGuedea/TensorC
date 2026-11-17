@@ -201,6 +201,34 @@ En una medición de referencia con matrices 512×512 y ocho repeticiones, la med
 
 El benchmark mide tiempo de CPU del proceso y los resultados conservaron el mismo checksum (`0.272000`).
 
+## Uso desde Python (bindings)
+
+El directorio [python/](python/) empaqueta el núcleo C como extensión CPython en
+C11, instalable con pip. El núcleo sigue siendo C puro; la extensión solo
+convierte objetos:
+
+```sh
+python3 -m pip install ./python
+```
+
+```python
+import tensorc
+
+x = tensorc.Tensor([1, 2, 3, 4], shape=(2, 2), requires_grad=True)
+w = tensorc.Tensor([1, 0, 0, 1], shape=(2, 2), requires_grad=True)
+loss = x.matmul(w).relu().sum()
+loss.backward()
+x.sgd_step(0.01)
+
+capa = tensorc.Conv2DLayer(1, 8, 3, 3, stride=(1, 1), padding=(1, 1), seed=42)
+opt = tensorc.Adam([capa.kernel, capa.bias, w], 0.001)
+```
+
+Para publicar en PyPI: `python3 -m build` dentro de `python/` y
+`python3 -m twine upload dist/*`; para ruedas multiplataforma usa
+[cibuildwheel](https://cibuildwheel.readthedocs.io/). El núcleo C se
+vendoriza en `python/tensorc/core/` (actualízalo con `python/sync_core.sh`).
+
 ## Usarlo desde otro proyecto CMake
 
 Después de instalar TensorC, agrega el directorio de instalación a `CMAKE_PREFIX_PATH`, enlaza `TensorC::tensorc` e incluye `<tensorc/tensorc.h>`.
@@ -222,6 +250,7 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.7: stride y padding configurables en Conv2D, ruta im2col+GEMM para convoluciones grandes en Accelerate, y benchmark reproducible contra NumPy.
 - 0.8: capa convolucional de alto nivel, max pooling y reshape en el grafo, pasos SGD, y ejemplo CNN entrenable en C puro con MNIST (IDX) o dataset sintético.
 - 0.9: softmax y cross-entropy en el grafo, optimizador Adam sobre listas de parámetros; la CNN de ejemplo llega a 93 % en MNIST.
+- 0.10: bindings oficiales de Python: extensión CPython escrita en C11 sobre el mismo núcleo, instalable con `pip install ./python` y publicable en PyPI.
 - Siguientes pasos: capa densa de alto nivel, guardado/carga de la CNN y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.

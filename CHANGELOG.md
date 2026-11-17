@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0 — bindings de Python (paquete `tensorc` en pip)
+
+- Nuevo módulo de extensión CPython escrito en C11 (`python/tensorc/_tensorc.c`) sobre el mismo núcleo del repo: sin C++, sin ctypes, sin dependencias externas más allá de CPython y NumPy (solo como formato de intercambio).
+- Expone `Tensor` (constructor desde datos planos + shape, `zeros`, `backward`, `sgd_step`, `add`, `mul`, `matmul`, `relu`, `softmax`, `sum`, `mse_loss`, `cross_entropy`, `maxpool2d`, `reshape`, `conv2d` con stride/padding), `Conv2DLayer` y `Adam`.
+- El constructor `Tensor(data, ...)` acepta cualquier objeto con protocolo de buffer (NumPy 1.x y 2.x, `array`, memoria contigua): float32 se copia directo, float64 se convierte, y la shape se infiere del buffer si no se pasa.
+- Empaquetado con `pyproject.toml` + `setup.py`: `pip install ./python` compila el núcleo C y la extensión en una sola pasada; publicable en PyPI con `python -m build` + `twine` (ver `python/README.md`).
+- El núcleo se vendoriza en `python/tensorc/core/` mediante `python/sync_core.sh` para que el paquete sea autocontenido; los cambios al núcleo C requieren re-sincronizar antes de publicar.
+- Verificado: conv2d con valores y gradientes exactos contra referencia, entrenamiento softmax+CE+Adam al 95 %, estrés de 10 000 grafos sin fugas ni crashes. La suite C sigue intacta (7/7 en ambos backends).
+
 ## 0.9.0 — softmax, cross-entropy y Adam en el grafo
 
 - Nueva operación `tc_tensor_nd_softmax` (última dimensión) con gradiente estable.

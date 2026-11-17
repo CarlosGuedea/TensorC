@@ -35,6 +35,7 @@ void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor);
 int tc_tensor_nd_reshape(tc_tensor_nd *tensor, const size_t *shape,
                          size_t ndim);
 
+/* Elementwise operations support trailing-dimension broadcasting. */
 tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b);
 tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b);
 /* Matrix multiplication is currently defined for two rank-2 tensors. */

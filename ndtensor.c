@@ -182,21 +182,75 @@ static int same_shape(const tc_tensor_nd *a, const tc_tensor_nd *b) {
     return memcmp(a->shape, b->shape, a->ndim * sizeof(size_t)) == 0;
 }
 
+/* NumPy-style trailing-dimension broadcasting for elementwise operations. */
+static int broadcast_shape(const tc_tensor_nd *a, const tc_tensor_nd *b,
+                           size_t **shape_out, size_t *ndim_out) {
+    if (!a || !b || !shape_out || !ndim_out) return 0;
+    const size_t ndim = a->ndim > b->ndim ? a->ndim : b->ndim;
+    if (ndim > (size_t)-1 / sizeof(size_t)) return 0;
+    size_t *shape = (size_t *)malloc(ndim * sizeof(*shape));
+    if (!shape) return 0;
+
+    const size_t a_offset = ndim - a->ndim;
+    const size_t b_offset = ndim - b->ndim;
+    for (size_t axis = 0; axis < ndim; ++axis) {
+        const size_t a_dim = axis < a_offset ? 1 : a->shape[axis - a_offset];
+        const size_t b_dim = axis < b_offset ? 1 : b->shape[axis - b_offset];
+        if (a_dim != b_dim && a_dim != 1 && b_dim != 1) {
+            free(shape);
+            return 0;
+        }
+        shape[axis] = a_dim > b_dim ? a_dim : b_dim;
+    }
+    *shape_out = shape;
+    *ndim_out = ndim;
+    return 1;
+}
+
+static size_t broadcast_index(const tc_tensor_nd *input,
+                              const tc_tensor_nd *output,
+                              size_t output_index) {
+    const size_t offset = output->ndim - input->ndim;
+    size_t input_index = 0;
+    for (size_t axis = 0; axis < input->ndim; ++axis) {
+        const size_t output_axis = axis + offset;
+        const size_t coordinate =
+            (output_index / output->strides[output_axis]) % output->shape[output_axis];
+        if (input->shape[axis] != 1)
+            input_index += coordinate * input->strides[axis];
+    }
+    return input_index;
+}
+
 tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
-    if (!same_shape(a, b)) return NULL;
-    tc_tensor_nd *result = operation_result(a->shape, a->ndim, TC_ND_OP_ADD,
+    size_t *shape = NULL;
+    size_t ndim = 0;
+    if (!broadcast_shape(a, b, &shape, &ndim)) return NULL;
+    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_ADD,
                                             (tc_tensor_nd *)a, (tc_tensor_nd *)b);
+    free(shape);
     if (!result) return NULL;
-    for (size_t i = 0; i < a->size; ++i) result->data[i] = a->data[i] + b->data[i];
+    for (size_t i = 0; i < result->size; ++i) {
+        const size_t a_index = broadcast_index(a, result, i);
+        const size_t b_index = broadcast_index(b, result, i);
+        result->data[i] = a->data[a_index] + b->data[b_index];
+    }
     return result;
 }
 
 tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
-    if (!same_shape(a, b)) return NULL;
-    tc_tensor_nd *result = operation_result(a->shape, a->ndim, TC_ND_OP_MUL,
+    size_t *shape = NULL;
+    size_t ndim = 0;
+    if (!broadcast_shape(a, b, &shape, &ndim)) return NULL;
+    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_MUL,
                                             (tc_tensor_nd *)a, (tc_tensor_nd *)b);
+    free(shape);
     if (!result) return NULL;
-    for (size_t i = 0; i < a->size; ++i) result->data[i] = a->data[i] * b->data[i];
+    for (size_t i = 0; i < result->size; ++i) {
+        const size_t a_index = broadcast_index(a, result, i);
+        const size_t b_index = broadcast_index(b, result, i);
+        result->data[i] = a->data[a_index] * b->data[b_index];
+    }
     return result;
 }
 
@@ -294,14 +348,16 @@ static void backward_node(tc_tensor_nd *tensor) {
     switch (tensor->op) {
         case TC_ND_OP_ADD:
             for (size_t i = 0; i < tensor->size; ++i) {
-                add_grad(a, i, tensor->grad[i]);
-                add_grad(b, i, tensor->grad[i]);
+                add_grad(a, broadcast_index(a, tensor, i), tensor->grad[i]);
+                add_grad(b, broadcast_index(b, tensor, i), tensor->grad[i]);
             }
             break;
         case TC_ND_OP_MUL:
             for (size_t i = 0; i < tensor->size; ++i) {
-                add_grad(a, i, tensor->grad[i] * b->data[i]);
-                add_grad(b, i, tensor->grad[i] * a->data[i]);
+                const size_t a_index = broadcast_index(a, tensor, i);
+                const size_t b_index = broadcast_index(b, tensor, i);
+                add_grad(a, a_index, tensor->grad[i] * b->data[b_index]);
+                add_grad(b, b_index, tensor->grad[i] * a->data[a_index]);
             }
             break;
         case TC_ND_OP_MATMUL:

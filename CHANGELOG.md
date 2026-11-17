@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 — broadcasting en tensores N-dimensionales
+
+- `add` y `mul` aceptan dimensiones compatibles alineadas a la derecha.
+- Los gradientes se acumulan correctamente en los ejes transmitidos.
+- Se agregó una prueba CTest para resultados y gradientes con matrices y vectores.
+
 ## 0.3.2 — backend Accelerate para álgebra lineal
 
 - Uso opcional de Apple Accelerate/BLAS para multiplicaciones grandes de matrices.

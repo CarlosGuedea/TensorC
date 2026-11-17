@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.3.2 LANGUAGES C)
+project(TensorC VERSION 0.4.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_USE_ACCELERATE "Use Apple Accelerate for large matrix operations" ON)
@@ -55,6 +55,9 @@ if(BUILD_TESTING)
     add_executable(tensorc_test_matmul tests/test_matmul.c)
     target_link_libraries(tensorc_test_matmul PRIVATE TensorC::tensorc)
     add_test(NAME tensorc_matmul COMMAND tensorc_test_matmul)
+    add_executable(tensorc_test_broadcast tests/test_broadcast.c)
+    target_link_libraries(tensorc_test_broadcast PRIVATE TensorC::tensorc)
+    add_test(NAME tensorc_broadcast COMMAND tensorc_test_broadcast)
 endif()
 
 include(GNUInstallDirs)

@@ -285,6 +285,36 @@ static size_t broadcast_index(const tc_tensor_nd *input,
     return input_index;
 }
 
+/* Devuelve 1 si `full` tiene exactamente la forma de `out` y `vec` es el
+ * vector fila [1, out->shape[1]] que se difunde sobre las filas — el
+ * patrón sesgo de cada capa. Evita la aritmética de strides por elemento. */
+static int is_row_broadcast(const tc_tensor_nd *full, const tc_tensor_nd *vec,
+                            const tc_tensor_nd *out, size_t *cols) {
+    if (full->ndim != 2 || out->ndim != 2 || vec->ndim != 2 ||
+        full->shape[0] != out->shape[0] ||
+        full->shape[1] != out->shape[1] || vec->shape[0] != 1 ||
+        vec->shape[1] != out->shape[1]) return 0;
+    *cols = out->shape[1];
+    return 1;
+}
+
+/* Suma con difusión de filas: out[i,j] = a[i,j] (+|*) v[j]. */
+static void row_broadcast_binary(const tc_tensor_nd *a, const tc_tensor_nd *v,
+                                 tc_tensor_nd *result, int multiply) {
+    const size_t rows = result->shape[0], cols = result->shape[1];
+    if (multiply) {
+        for (size_t i = 0; i < rows; ++i)
+            for (size_t j = 0; j < cols; ++j)
+                result->data[i * cols + j] =
+                    a->data[i * cols + j] * v->data[j];
+    } else {
+        for (size_t i = 0; i < rows; ++i)
+            for (size_t j = 0; j < cols; ++j)
+                result->data[i * cols + j] =
+                    a->data[i * cols + j] + v->data[j];
+    }
+}
+
 tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
     size_t *shape = NULL;
     size_t ndim = 0;
@@ -293,6 +323,15 @@ tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
+    size_t cols = 0;
+    if (is_row_broadcast(a, b, result, &cols)) {
+        row_broadcast_binary(a, b, result, 0);
+        return result;
+    }
+    if (is_row_broadcast(b, a, result, &cols)) {
+        row_broadcast_binary(b, a, result, 0);
+        return result;
+    }
     for (size_t i = 0; i < result->size; ++i) {
         const size_t a_index = broadcast_index(a, result, i);
         const size_t b_index = broadcast_index(b, result, i);
@@ -309,6 +348,15 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
+    size_t cols = 0;
+    if (is_row_broadcast(a, b, result, &cols)) {
+        row_broadcast_binary(a, b, result, 1);
+        return result;
+    }
+    if (is_row_broadcast(b, a, result, &cols)) {
+        row_broadcast_binary(b, a, result, 1);
+        return result;
+    }
     for (size_t i = 0; i < result->size; ++i) {
         const size_t a_index = broadcast_index(a, result, i);
         const size_t b_index = broadcast_index(b, result, i);
@@ -323,11 +371,26 @@ tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) 
     tc_tensor_nd *result = binary_result(shape, 2, TC_ND_OP_MATMUL,
                                             a, b);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_ACCELERATE
+    /* Ruta rápida: GEMM de Accelerate para tamaños donde el triple loop
+     * escalar ya se nota. El producto m*n*k acota el trabajo. */
+    const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
+    if (m <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
+        n <= (size_t)INT_MAX && m > 0 && k > 0 && n > 0 &&
+        m <= ((size_t)-1) / n && k <= ((size_t)-1) / n &&
+        m * n * k >= ((size_t)1 << 12)) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)m, (int)n, (int)k,
+                    1.0f, a->data, (int)k, b->data, (int)n,
+                    0.0f, result->data, (int)n);
+        return result;
+    }
+#endif
     for (size_t i = 0; i < a->shape[0]; ++i)
-        for (size_t k = 0; k < a->shape[1]; ++k)
+        for (size_t k2 = 0; k2 < a->shape[1]; ++k2)
             for (size_t j = 0; j < b->shape[1]; ++j)
                 result->data[i * b->shape[1] + j] +=
-                    a->data[i * a->shape[1] + k] * b->data[k * b->shape[1] + j];
+                    a->data[i * a->shape[1] + k2] * b->data[k2 * b->shape[1] + j];
     return result;
 }
 
@@ -1077,13 +1140,67 @@ static void backward_node(tc_tensor_nd *tensor) {
     tc_tensor_nd *a = tensor->parent_count > 0 ? tensor->parents[0] : NULL;
     tc_tensor_nd *b = tensor->parent_count > 1 ? tensor->parents[1] : NULL;
     switch (tensor->op) {
-        case TC_ND_OP_ADD:
+        case TC_ND_OP_ADD: {
+            size_t cols = 0;
+            /* Sesgo difundido por filas: a es [rows,cols], b es [1,cols]. */
+            if (is_row_broadcast(a, b, tensor, &cols)) {
+                const size_t rows = tensor->shape[0];
+                if (a->requires_grad && a->grad)
+                    for (size_t i = 0; i < tensor->size; ++i)
+                        a->grad[i] += tensor->grad[i];
+                if (b->requires_grad && b->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            b->grad[j] += tensor->grad[i * cols + j];
+                break;
+            }
+            if (is_row_broadcast(b, a, tensor, &cols)) {
+                const size_t rows = tensor->shape[0];
+                if (b->requires_grad && b->grad)
+                    for (size_t i = 0; i < tensor->size; ++i)
+                        b->grad[i] += tensor->grad[i];
+                if (a->requires_grad && a->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            a->grad[j] += tensor->grad[i * cols + j];
+                break;
+            }
             for (size_t i = 0; i < tensor->size; ++i) {
                 add_grad(a, broadcast_index(a, tensor, i), tensor->grad[i]);
                 add_grad(b, broadcast_index(b, tensor, i), tensor->grad[i]);
             }
             break;
-        case TC_ND_OP_MUL:
+        }
+        case TC_ND_OP_MUL: {
+            size_t cols = 0;
+            if (is_row_broadcast(a, b, tensor, &cols)) {
+                const size_t rows = tensor->shape[0];
+                if (a->requires_grad && a->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            a->grad[i * cols + j] +=
+                                tensor->grad[i * cols + j] * b->data[j];
+                if (b->requires_grad && b->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            b->grad[j] +=
+                                tensor->grad[i * cols + j] * a->data[i * cols + j];
+                break;
+            }
+            if (is_row_broadcast(b, a, tensor, &cols)) {
+                const size_t rows = tensor->shape[0];
+                if (b->requires_grad && b->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            b->grad[i * cols + j] +=
+                                tensor->grad[i * cols + j] * a->data[j];
+                if (a->requires_grad && a->grad)
+                    for (size_t i = 0; i < rows; ++i)
+                        for (size_t j = 0; j < cols; ++j)
+                            a->grad[j] +=
+                                tensor->grad[i * cols + j] * b->data[i * cols + j];
+                break;
+            }
             for (size_t i = 0; i < tensor->size; ++i) {
                 const size_t a_index = broadcast_index(a, tensor, i);
                 const size_t b_index = broadcast_index(b, tensor, i);
@@ -1091,7 +1208,51 @@ static void backward_node(tc_tensor_nd *tensor) {
                 add_grad(b, b_index, tensor->grad[i] * a->data[a_index]);
             }
             break;
-        case TC_ND_OP_MATMUL:
+        }
+        case TC_ND_OP_MATMUL: {
+#ifdef TENSORC_HAS_ACCELERATE
+            /* dA = grad @ Bᵀ y dB = Aᵀ @ grad vía GEMM; el resultado se
+             * acumula sobre los gradientes existentes, igual que la ruta
+             * genérica. Si la memoria temporal falla se cae al loop. */
+            const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
+            if (m <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
+                n <= (size_t)INT_MAX && m > 0 && k > 0 && n > 0 &&
+                m <= ((size_t)-1) / n && k <= ((size_t)-1) / n &&
+                m * n * k >= ((size_t)1 << 12)) {
+                const int want_a = a->requires_grad && a->grad;
+                const int want_b = b->requires_grad && b->grad;
+                float *tmp_a = want_a
+                    ? (float *)malloc(m * k * sizeof(float)) : NULL;
+                float *tmp_b = want_b
+                    ? (float *)malloc(k * n * sizeof(float)) : NULL;
+                if ((want_a && !tmp_a) || (want_b && !tmp_b)) {
+                    free(tmp_a);
+                    free(tmp_b);
+                } else {
+                    if (tmp_a) {
+                        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                                    (int)m, (int)k, (int)n,
+                                    1.0f, tensor->grad, (int)n,
+                                    b->data, (int)n,
+                                    0.0f, tmp_a, (int)k);
+                        for (size_t i = 0; i < m * k; ++i)
+                            a->grad[i] += tmp_a[i];
+                    }
+                    if (tmp_b) {
+                        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                                    (int)k, (int)n, (int)m,
+                                    1.0f, a->data, (int)k,
+                                    tensor->grad, (int)n,
+                                    0.0f, tmp_b, (int)n);
+                        for (size_t i = 0; i < k * n; ++i)
+                            b->grad[i] += tmp_b[i];
+                    }
+                    free(tmp_a);
+                    free(tmp_b);
+                    break;
+                }
+            }
+#endif
             for (size_t i = 0; i < a->shape[0]; ++i)
                 for (size_t k = 0; k < a->shape[1]; ++k) {
                     float value = 0.0f;
@@ -1109,6 +1270,7 @@ static void backward_node(tc_tensor_nd *tensor) {
                     add_grad(b, k * b->shape[1] + j, value);
                 }
             break;
+        }
         case TC_ND_OP_CONV2D: {
 #ifdef TENSORC_HAS_ACCELERATE
             if (conv2d_accelerate_backward(a, b, tensor)) break;

@@ -39,6 +39,18 @@ tc_model_free(&model);
 
 Consulta [examples/xor_public_api.c](examples/xor_public_api.c) para un programa completo.
 
+## Adam y minibatches
+
+La API incluye SGD y Adam. `batch_size` acumula gradientes antes de actualizar los parámetros:
+
+```c
+tc_optimizer optimizer = tc_optimizer_adam(&model, 0.001f);
+tc_model_train_epoch_opt(&model, &x, &y, &optimizer, 32);
+tc_optimizer_free(&optimizer);
+```
+
+El ejemplo `examples/xor_adam.c` usa Adam con un minibatch de cuatro muestras.
+
 ## Usarlo desde otro proyecto CMake
 
 Después de instalar TensorC, agrega el directorio de instalación a `CMAKE_PREFIX_PATH`, enlaza `TensorC::tensorc` e incluye `<tensorc/tensorc.h>`.
@@ -52,7 +64,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 ## Estado del proyecto
 
 - 0.1: CPU, tensores 2D, capas densas y SGD.
-- Siguientes pasos: batching eficiente, Adam, serialización, gradientes de operaciones tensoriales y backends acelerados.
+- 0.2 en desarrollo: acumulación de gradientes por minibatch y Adam.
+- Siguientes pasos: serialización, gradientes de operaciones tensoriales y backends acelerados.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

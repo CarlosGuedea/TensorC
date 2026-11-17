@@ -27,6 +27,8 @@ set_target_properties(tensorc PROPERTIES
 if(TENSORC_BUILD_EXAMPLES)
     add_executable(tensorc_xor examples/xor_public_api.c)
     target_link_libraries(tensorc_xor PRIVATE TensorC::tensorc)
+    add_executable(tensorc_xor_adam examples/xor_adam.c)
+    target_link_libraries(tensorc_xor_adam PRIVATE TensorC::tensorc)
 endif()
 
 include(GNUInstallDirs)

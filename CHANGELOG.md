@@ -7,3 +7,9 @@
 - Retropropagación, MSE y entrenamiento SGD muestra por muestra.
 - API pública C, compilación e instalación con CMake.
 - Ejemplo XOR.
+
+## Próximo 0.2.0
+
+- Optimizador Adam con corrección de sesgo.
+- Acumulación de gradientes y entrenamiento por minibatches.
+- Ejemplo XOR con Adam.

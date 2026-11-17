@@ -156,19 +156,85 @@ MTTensor mt_model_predict(const MTModel *model, const MTTensor *input) {
     return current;
 }
 
-float mt_model_train_sample(MTModel *model, const MTTensor *input,
-                            const MTTensor *target, float learning_rate) {
+typedef struct {
+    size_t layer_count;
+    float **weights;
+    float **biases;
+} MTGradients;
+
+static MTGradients gradients_create(const MTModel *model) {
+    MTGradients gradients = {0, NULL, NULL};
+    if (!model || !model->layers || model->layer_count == 0) return gradients;
+    gradients.layer_count = model->layer_count;
+    gradients.weights = (float **)calloc(gradients.layer_count, sizeof(float *));
+    gradients.biases = (float **)calloc(gradients.layer_count, sizeof(float *));
+    if (!gradients.weights || !gradients.biases) goto fail;
+    for (size_t l = 0; l < gradients.layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        gradients.weights[l] = (float *)calloc(layer->input_size * layer->output_size, sizeof(float));
+        gradients.biases[l] = (float *)calloc(layer->output_size, sizeof(float));
+        if (!gradients.weights[l] || !gradients.biases[l]) goto fail;
+    }
+    return gradients;
+fail:
+    for (size_t l = 0; l < gradients.layer_count; ++l) {
+        free(gradients.weights ? gradients.weights[l] : NULL);
+        free(gradients.biases ? gradients.biases[l] : NULL);
+    }
+    free(gradients.weights);
+    free(gradients.biases);
+    gradients.layer_count = 0;
+    gradients.weights = gradients.biases = NULL;
+    return gradients;
+}
+
+static void gradients_free(MTGradients *gradients) {
+    if (!gradients) return;
+    for (size_t l = 0; l < gradients->layer_count; ++l) {
+        free(gradients->weights[l]);
+        free(gradients->biases[l]);
+    }
+    free(gradients->weights);
+    free(gradients->biases);
+    gradients->layer_count = 0;
+    gradients->weights = gradients->biases = NULL;
+}
+
+static void gradients_zero(const MTModel *model, MTGradients *gradients) {
+    for (size_t l = 0; l < model->layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        memset(gradients->weights[l], 0, layer->input_size * layer->output_size * sizeof(float));
+        memset(gradients->biases[l], 0, layer->output_size * sizeof(float));
+    }
+}
+
+static void gradients_add(const MTModel *model, MTGradients *destination,
+                          const MTGradients *source) {
+    for (size_t l = 0; l < model->layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        for (size_t i = 0; i < layer->input_size * layer->output_size; ++i)
+            destination->weights[l][i] += source->weights[l][i];
+        for (size_t j = 0; j < layer->output_size; ++j)
+            destination->biases[l][j] += source->biases[l][j];
+    }
+}
+
+static float compute_gradients(const MTModel *model, const MTTensor *input,
+                               const MTTensor *target, MTGradients *gradients) {
     if (!valid_input(model, input) || !target || !target->data || target->rows != 1 ||
-        target->cols != model->layers[model->layer_count - 1].output_size || learning_rate <= 0.0f)
-        return NAN;
+        target->cols != model->layers[model->layer_count - 1].output_size ||
+        !gradients || gradients->layer_count != model->layer_count) return NAN;
+
     const size_t L = model->layer_count;
     float **acts = (float **)calloc(L + 1, sizeof(float *));
     float **zs = (float **)calloc(L, sizeof(float *));
     float **deltas = (float **)calloc(L, sizeof(float *));
-    if (!acts || !zs || !deltas) { free(acts); free(zs); free(deltas); return NAN; }
+    if (!acts || !zs || !deltas) goto fail;
+    gradients_zero(model, gradients);
     acts[0] = (float *)malloc(input->cols * sizeof(float));
     if (!acts[0]) goto fail;
     memcpy(acts[0], input->data, input->cols * sizeof(float));
+
     for (size_t l = 0; l < L; ++l) {
         MTLayer *layer = &model->layers[l];
         acts[l + 1] = (float *)malloc(layer->output_size * sizeof(float));
@@ -183,14 +249,16 @@ float mt_model_train_sample(MTModel *model, const MTTensor *input,
             acts[l + 1][j] = activate(z, layer->activation);
         }
     }
+
     MTLayer *last = &model->layers[L - 1];
     float loss = 0.0f;
     for (size_t j = 0; j < last->output_size; ++j) {
-        float error = acts[L][j] - target->data[j];
+        const float error = acts[L][j] - target->data[j];
         loss += error * error;
         deltas[L - 1][j] = error * activation_grad(zs[L - 1][j], acts[L][j], last->activation);
     }
     loss /= (float)last->output_size;
+
     for (size_t rev = L - 1; rev > 0; --rev) {
         MTLayer *layer = &model->layers[rev - 1];
         MTLayer *next = &model->layers[rev];
@@ -201,14 +269,16 @@ float mt_model_train_sample(MTModel *model, const MTTensor *input,
             deltas[rev - 1][i] = propagated * activation_grad(zs[rev - 1][i], acts[rev][i], layer->activation);
         }
     }
+
     for (size_t l = 0; l < L; ++l) {
-        MTLayer *layer = &model->layers[l];
+        const MTLayer *layer = &model->layers[l];
         for (size_t i = 0; i < layer->input_size; ++i)
             for (size_t j = 0; j < layer->output_size; ++j)
-                layer->weights[i * layer->output_size + j] -= learning_rate * acts[l][i] * deltas[l][j];
+                gradients->weights[l][i * layer->output_size + j] = acts[l][i] * deltas[l][j];
         for (size_t j = 0; j < layer->output_size; ++j)
-            layer->biases[j] -= learning_rate * deltas[l][j];
+            gradients->biases[l][j] = deltas[l][j];
     }
+
     for (size_t l = 0; l <= L; ++l) free(acts[l]);
     for (size_t l = 0; l < L; ++l) { free(zs[l]); free(deltas[l]); }
     free(acts); free(zs); free(deltas);
@@ -221,19 +291,171 @@ fail:
     return NAN;
 }
 
-float mt_model_train_epoch(MTModel *model, const MTTensor *x,
-                           const MTTensor *y, float learning_rate) {
-    if (!model || !x || !y || !x->data || !y->data || x->rows != y->rows ||
-        x->cols != model->input_size || x->rows == 0) return NAN;
-    float total = 0.0f;
+MTOptimizer mt_optimizer_sgd(float learning_rate) {
+    MTOptimizer optimizer = {0};
+    optimizer.type = MT_OPT_SGD;
+    optimizer.learning_rate = learning_rate;
+    optimizer.epsilon = 1e-8f;
+    return optimizer;
+}
+
+MTOptimizer mt_optimizer_adam(const MTModel *model, float learning_rate) {
+    MTOptimizer optimizer = {0};
+    if (!model || !model->layers || model->layer_count == 0 || learning_rate <= 0.0f) return optimizer;
+    optimizer.type = MT_OPT_ADAM;
+    optimizer.learning_rate = learning_rate;
+    optimizer.beta1 = 0.9f;
+    optimizer.beta2 = 0.999f;
+    optimizer.epsilon = 1e-8f;
+    optimizer.layer_count = model->layer_count;
+    optimizer.m_weights = (float **)calloc(optimizer.layer_count, sizeof(float *));
+    optimizer.v_weights = (float **)calloc(optimizer.layer_count, sizeof(float *));
+    optimizer.m_biases = (float **)calloc(optimizer.layer_count, sizeof(float *));
+    optimizer.v_biases = (float **)calloc(optimizer.layer_count, sizeof(float *));
+    if (!optimizer.m_weights || !optimizer.v_weights || !optimizer.m_biases || !optimizer.v_biases) goto fail;
+    for (size_t l = 0; l < optimizer.layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        const size_t weight_count = layer->input_size * layer->output_size;
+        optimizer.m_weights[l] = (float *)calloc(weight_count, sizeof(float));
+        optimizer.v_weights[l] = (float *)calloc(weight_count, sizeof(float));
+        optimizer.m_biases[l] = (float *)calloc(layer->output_size, sizeof(float));
+        optimizer.v_biases[l] = (float *)calloc(layer->output_size, sizeof(float));
+        if (!optimizer.m_weights[l] || !optimizer.v_weights[l] ||
+            !optimizer.m_biases[l] || !optimizer.v_biases[l]) goto fail;
+    }
+    return optimizer;
+fail:
+    mt_optimizer_free(&optimizer);
+    return (MTOptimizer){0};
+}
+
+void mt_optimizer_free(MTOptimizer *optimizer) {
+    if (!optimizer) return;
+    for (size_t l = 0; l < optimizer->layer_count; ++l) {
+        free(optimizer->m_weights ? optimizer->m_weights[l] : NULL);
+        free(optimizer->v_weights ? optimizer->v_weights[l] : NULL);
+        free(optimizer->m_biases ? optimizer->m_biases[l] : NULL);
+        free(optimizer->v_biases ? optimizer->v_biases[l] : NULL);
+    }
+    free(optimizer->m_weights);
+    free(optimizer->v_weights);
+    free(optimizer->m_biases);
+    free(optimizer->v_biases);
+    *optimizer = (MTOptimizer){0};
+}
+
+static int optimizer_valid(const MTModel *model, const MTOptimizer *optimizer) {
+    if (!model || !optimizer || optimizer->learning_rate <= 0.0f) return 0;
+    if (optimizer->type == MT_OPT_SGD) return 1;
+    return optimizer->type == MT_OPT_ADAM && optimizer->layer_count == model->layer_count &&
+           optimizer->m_weights && optimizer->v_weights && optimizer->m_biases && optimizer->v_biases;
+}
+
+static void apply_gradients(MTModel *model, const MTGradients *gradients,
+                            MTOptimizer *optimizer, float scale) {
+    optimizer->step++;
+    const float t = (float)optimizer->step;
+    const float correction1 = 1.0f - powf(optimizer->beta1, t);
+    const float correction2 = 1.0f - powf(optimizer->beta2, t);
+    for (size_t l = 0; l < model->layer_count; ++l) {
+        MTLayer *layer = &model->layers[l];
+        const size_t weight_count = layer->input_size * layer->output_size;
+        for (size_t i = 0; i < weight_count; ++i) {
+            const float gradient = gradients->weights[l][i] * scale;
+            if (optimizer->type == MT_OPT_ADAM) {
+                optimizer->m_weights[l][i] = optimizer->beta1 * optimizer->m_weights[l][i] + (1.0f - optimizer->beta1) * gradient;
+                optimizer->v_weights[l][i] = optimizer->beta2 * optimizer->v_weights[l][i] + (1.0f - optimizer->beta2) * gradient * gradient;
+                const float m_hat = optimizer->m_weights[l][i] / correction1;
+                const float v_hat = optimizer->v_weights[l][i] / correction2;
+                layer->weights[i] -= optimizer->learning_rate * m_hat / (sqrtf(v_hat) + optimizer->epsilon);
+            } else {
+                layer->weights[i] -= optimizer->learning_rate * gradient;
+            }
+        }
+        for (size_t j = 0; j < layer->output_size; ++j) {
+            const float gradient = gradients->biases[l][j] * scale;
+            if (optimizer->type == MT_OPT_ADAM) {
+                optimizer->m_biases[l][j] = optimizer->beta1 * optimizer->m_biases[l][j] + (1.0f - optimizer->beta1) * gradient;
+                optimizer->v_biases[l][j] = optimizer->beta2 * optimizer->v_biases[l][j] + (1.0f - optimizer->beta2) * gradient * gradient;
+                const float m_hat = optimizer->m_biases[l][j] / correction1;
+                const float v_hat = optimizer->v_biases[l][j] / correction2;
+                layer->biases[j] -= optimizer->learning_rate * m_hat / (sqrtf(v_hat) + optimizer->epsilon);
+            } else {
+                layer->biases[j] -= optimizer->learning_rate * gradient;
+            }
+        }
+    }
+}
+
+float mt_model_train_sample_opt(MTModel *model, const MTTensor *input,
+                                const MTTensor *target, MTOptimizer *optimizer) {
+    if (!optimizer_valid(model, optimizer)) return NAN;
+    MTGradients gradients = gradients_create(model);
+    if (!gradients.weights) return NAN;
+    const float loss = compute_gradients(model, input, target, &gradients);
+    if (!isnan(loss)) apply_gradients(model, &gradients, optimizer, 1.0f);
+    gradients_free(&gradients);
+    return loss;
+}
+
+float mt_model_train_sample(MTModel *model, const MTTensor *input,
+                            const MTTensor *target, float learning_rate) {
+    MTOptimizer optimizer = mt_optimizer_sgd(learning_rate);
+    return mt_model_train_sample_opt(model, input, target, &optimizer);
+}
+
+float mt_model_train_batch(MTModel *model, const MTTensor *x,
+                           const MTTensor *y, MTOptimizer *optimizer,
+                           size_t batch_size) {
+    if (!optimizer_valid(model, optimizer) || !x || !y || !x->data || !y->data ||
+        x->rows != y->rows || x->rows == 0 || x->cols != model->input_size || batch_size == 0 ||
+        y->cols != model->layers[model->layer_count - 1].output_size) return NAN;
+    if (batch_size > x->rows) batch_size = x->rows;
+    MTGradients accumulated = gradients_create(model);
+    MTGradients sample = gradients_create(model);
     MTTensor xi = mt_tensor_create(1, x->cols);
     MTTensor yi = mt_tensor_create(1, y->cols);
-    if (!xi.data || !yi.data) { mt_tensor_free(&xi); mt_tensor_free(&yi); return NAN; }
-    for (size_t r = 0; r < x->rows; ++r) {
-        memcpy(xi.data, &x->data[r * x->cols], x->cols * sizeof(float));
-        memcpy(yi.data, &y->data[r * y->cols], y->cols * sizeof(float));
-        total += mt_model_train_sample(model, &xi, &yi, learning_rate);
+    if (!accumulated.weights || !sample.weights || !xi.data || !yi.data) {
+        gradients_free(&accumulated); gradients_free(&sample);
+        mt_tensor_free(&xi); mt_tensor_free(&yi);
+        return NAN;
     }
+    float total_loss = 0.0f;
+    size_t processed = 0;
+    while (processed < x->rows) {
+        const size_t count = (x->rows - processed < batch_size) ? x->rows - processed : batch_size;
+        gradients_zero(model, &accumulated);
+        for (size_t offset = 0; offset < count; ++offset) {
+            const size_t row = processed + offset;
+            memcpy(xi.data, &x->data[row * x->cols], x->cols * sizeof(float));
+            memcpy(yi.data, &y->data[row * y->cols], y->cols * sizeof(float));
+            const float loss = compute_gradients(model, &xi, &yi, &sample);
+            if (isnan(loss)) {
+                gradients_free(&accumulated); gradients_free(&sample);
+                mt_tensor_free(&xi); mt_tensor_free(&yi);
+                return NAN;
+            }
+            total_loss += loss;
+            gradients_add(model, &accumulated, &sample);
+        }
+        apply_gradients(model, &accumulated, optimizer, 1.0f / (float)count);
+        processed += count;
+    }
+    gradients_free(&accumulated); gradients_free(&sample);
     mt_tensor_free(&xi); mt_tensor_free(&yi);
-    return total / (float)x->rows;
+    return total_loss / (float)x->rows;
+}
+
+float mt_model_train_epoch_opt(MTModel *model, const MTTensor *x,
+                               const MTTensor *y, MTOptimizer *optimizer,
+                               size_t batch_size) {
+    if (!x || x->rows == 0) return NAN;
+    if (batch_size == 0) batch_size = x->rows;
+    return mt_model_train_batch(model, x, y, optimizer, batch_size);
+}
+
+float mt_model_train_epoch(MTModel *model, const MTTensor *x,
+                           const MTTensor *y, float learning_rate) {
+    MTOptimizer optimizer = mt_optimizer_sgd(learning_rate);
+    return mt_model_train_epoch_opt(model, x, y, &optimizer, 1);
 }

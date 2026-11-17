@@ -24,3 +24,10 @@ packages = ["tensorc"]
 
 [tool.setuptools.package-data]
 tensorc = ["*.pyi"]
+
+[tool.cibuildwheel]
+# CPython 3.9–3.13 en todas las plataformas; sin PyPy ni musl.
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux_* *-win32 *-manylinux_i686 pp*"
+# Prueba de humo en cada rueda: importar, matmul y backward básicos.
+test-command = "python -c \"import tensorc; x = tensorc.Tensor([1.0, 2.0, 3.0, 4.0], shape=(2, 2), requires_grad=True); w = tensorc.Tensor([1, 0, 0, 1], shape=(2, 2)); loss = x.matmul(w).relu().sum(); loss.backward(); assert len(x.grad) == 4; print('wheel OK', tensorc.__version__)\""

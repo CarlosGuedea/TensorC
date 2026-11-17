@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0 — softmax, cross-entropy y Adam en el grafo
+
+- Nueva operación `tc_tensor_nd_softmax` (última dimensión) con gradiente estable.
+- Nueva pérdida `tc_tensor_nd_cross_entropy` (media por fila, probabilidades clamp a 1e-7).
+- Nuevo `tc_tensor_nd_optimizer_adam`: Adam sobre una lista fija de parámetros del grafo N-dim (betas 0.9/0.999, eps 1e-8, con corrección de sesgo).
+- El ejemplo `tensorc_cnn_mnist` usa softmax + cross-entropy + Adam: MNIST sube de 71 % a 93 % en las mismas 4 épocas; el sintético de 80 % a 100 %.
+- Pruebas de valores, gradientes por diferencias finitas (incluida la identidad d(softmax+CE)/dx = (p − t)/filas) y convergencia de Adam.
+
 ## 0.8.0 — capa convolucional y ejemplo CNN
 
 - Nueva operación de grafo `tc_tensor_nd_maxpool2d` (ventanas no traslapadas) con gradiente hacia el máximo de cada ventana.

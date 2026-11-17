@@ -68,6 +68,14 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
                                      const tc_tensor_nd *kernel,
                                      tc_conv2d_options options);
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input);
+/* Softmax over the last dimension (one distribution per row). */
+tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input);
+/*
+ * Mean cross-entropy over rows: prediction holds softmax probabilities and
+ * target holds one-hot rows; both tensors must have the same shape.
+ */
+tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
+                                         const tc_tensor_nd *target);
 /* Reshapes as a graph operation; the total element count must match. */
 tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
                                       const size_t *shape, size_t ndim);
@@ -88,6 +96,19 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name);
 
 /* Applies one SGD update: data -= learning_rate * grad. */
 void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate);
+
+/*
+ * Adam over a fixed parameter list (betas 0.9 / 0.999, epsilon 1e-8).
+ * The optimizer copies the pointer array; the caller keeps owning the
+ * tensors. Each step updates every parameter that carries a gradient.
+ */
+typedef struct tc_tensor_nd_optimizer tc_tensor_nd_optimizer;
+tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
+                                                    size_t count,
+                                                    float learning_rate);
+/* Applies one Adam step. Returns the number of updated parameters. */
+int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer);
+void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer);
 
 /*
  * High-level 2D convolution layer: kernel [K,C,KH,KW] plus bias [1,K,1,1],

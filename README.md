@@ -2,7 +2,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.8 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, suma y pérdida MSE, además de una capa convolucional de alto nivel con inicialización Xavier y pasos SGD. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación de modelos de TensorFlow.
+La versión 0.9 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencia, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, softmax, suma, pérdida MSE y cross-entropy, además de una capa convolucional de alto nivel con inicialización Xavier, pasos SGD y optimizador Adam. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -142,7 +142,7 @@ tc_tensor_nd_sgd_step(tc_conv2d_layer_bias(conv), 0.01f);
 tc_conv2d_layer_free(conv);
 ```
 
-El ejemplo [examples/cnn_mnist.c](examples/cnn_mnist.c) arma una CNN completa —conv(3×3) → ReLU → maxpool(2) → conv(3×3) → ReLU → maxpool(2) → aplanar → matmul + sesgo → MSE contra one-hot— y la entrena en C puro:
+El ejemplo [examples/cnn_mnist.c](examples/cnn_mnist.c) arma una CNN completa —conv(3×3) → ReLU → maxpool(2) → conv(3×3) → ReLU → maxpool(2) → aplanar → matmul + sesgo → softmax → cross-entropy contra one-hot— y la entrena en C puro con Adam:
 
 ```sh
 ./build/tensorc_cnn_mnist            # dataset sintético determinista
@@ -150,7 +150,19 @@ El ejemplo [examples/cnn_mnist.c](examples/cnn_mnist.c) arma una CNN completa �
                         t10k-images.idx3-ubyte t10k-labels.idx1-ubyte   # MNIST real
 ```
 
-En una medición de referencia en MacBook Pro M1, el modo sintético (800 imágenes 8×8, 30 épocas) entrenó en ~270 ms con 80 % de precisión en prueba; con MNIST real (8 192 imágenes de entrenamiento, 4 épocas, lotes de 64) obtuvo 71 % de precisión en 2 048 imágenes de prueba en ~9.8 s de entrenamiento.
+En una medición de referencia en MacBook Pro M1, el modo sintético (800 imágenes 8×8, 30 épocas) entrenó en ~280 ms con 100 % de precisión en prueba; con MNIST real (8 192 imágenes de entrenamiento, 4 épocas, lotes de 64, Adam lr 0.001) obtuvo 93 % de precisión en 2 048 imágenes de prueba en ~10.1 s de entrenamiento.
+
+### Softmax, cross-entropy y Adam
+
+La API del grafo incluye `tc_tensor_nd_softmax` (sobre la última dimensión) y `tc_tensor_nd_cross_entropy` (media por fila), cuya composición tiene gradiente `(p − t) / filas`. `tc_tensor_nd_optimizer_adam` aplica Adam sobre una lista fija de parámetros con corrección de sesgo:
+
+```c
+tc_tensor_nd *params[] = {kernel, bias, weights, out_bias};
+tc_tensor_nd_optimizer *opt = tc_tensor_nd_optimizer_adam(params, 4, 0.001f);
+/* forward + backward del lote, y después: */
+tc_tensor_nd_optimizer_step(opt);
+tc_tensor_nd_optimizer_free(opt);
+```
 
 ## Ejemplo Fahrenheit a Celsius
 
@@ -209,7 +221,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.6: convolución 2D válida con gradientes para entrada y kernels.
 - 0.7: stride y padding configurables en Conv2D, ruta im2col+GEMM para convoluciones grandes en Accelerate, y benchmark reproducible contra NumPy.
 - 0.8: capa convolucional de alto nivel, max pooling y reshape en el grafo, pasos SGD, y ejemplo CNN entrenable en C puro con MNIST (IDX) o dataset sintético.
-- Siguientes pasos: optimizadores sobre listas de parámetros (Adam), más operaciones (softmax/cross-entropy, dropout) y GPU.
+- 0.9: softmax y cross-entropy en el grafo, optimizador Adam sobre listas de parámetros; la CNN de ejemplo llega a 93 % en MNIST.
+- Siguientes pasos: capa densa de alto nivel, guardado/carga de la CNN y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

@@ -153,12 +153,14 @@ typedef struct {
     tc_conv2d_layer *conv2; /* NULL en la configuración pequeña */
     tc_tensor_nd *weights;  /* [features, clases] */
     tc_tensor_nd *bias;     /* [1, clases] */
+    tc_tensor_nd_optimizer *optimizer;
     size_t classes;
 } cnn;
 
 static int cnn_create(cnn *net, size_t in_channels, size_t conv1_filters,
                       size_t conv2_filters, int two_conv_layers,
-                      size_t features, size_t classes, unsigned int seed) {
+                      size_t features, size_t classes, unsigned int seed,
+                      float learning_rate) {
     memset(net, 0, sizeof(*net));
     net->classes = classes;
     const tc_conv2d_options options = {1, 1, 1, 1};
@@ -180,10 +182,26 @@ static int cnn_create(cnn *net, size_t in_channels, size_t conv1_filters,
     float *w = tc_tensor_nd_data(net->weights);
     for (size_t i = 0; i < tc_tensor_nd_numel(net->weights); ++i)
         w[i] = (2.0f * rng_uniform() - 1.0f) * limit;
-    return 1;
+
+    tc_tensor_nd *params[] = {
+        tc_conv2d_layer_kernel(net->conv1),
+        tc_conv2d_layer_bias(net->conv1),
+        net->conv2 ? tc_conv2d_layer_kernel(net->conv2) : NULL,
+        net->conv2 ? tc_conv2d_layer_bias(net->conv2) : NULL,
+        net->weights,
+        net->bias,
+    };
+    size_t count = two_conv_layers ? 6 : 4;
+    if (!two_conv_layers) {
+        params[2] = net->weights;
+        params[3] = net->bias;
+    }
+    net->optimizer = tc_tensor_nd_optimizer_adam(params, count, learning_rate);
+    return net->optimizer != NULL;
 }
 
 static void cnn_free(cnn *net) {
+    tc_tensor_nd_optimizer_free(net->optimizer);
     tc_conv2d_layer_free(net->conv1);
     tc_conv2d_layer_free(net->conv2);
     tc_tensor_nd_free(net->weights);
@@ -219,15 +237,8 @@ static tc_tensor_nd *cnn_forward(cnn *net, const tc_tensor_nd *input) {
     return out;
 }
 
-static void cnn_step(cnn *net, float learning_rate) {
-    tc_tensor_nd_sgd_step(tc_conv2d_layer_kernel(net->conv1), learning_rate);
-    tc_tensor_nd_sgd_step(tc_conv2d_layer_bias(net->conv1), learning_rate);
-    if (net->conv2) {
-        tc_tensor_nd_sgd_step(tc_conv2d_layer_kernel(net->conv2), learning_rate);
-        tc_tensor_nd_sgd_step(tc_conv2d_layer_bias(net->conv2), learning_rate);
-    }
-    tc_tensor_nd_sgd_step(net->weights, learning_rate);
-    tc_tensor_nd_sgd_step(net->bias, learning_rate);
+static void cnn_train_step(cnn *net) {
+    tc_tensor_nd_optimizer_step(net->optimizer);
 }
 
 static double now_ms(void) {
@@ -245,8 +256,7 @@ static float *build_targets(const dataset *ds, size_t begin, size_t batch) {
 }
 
 static int run_batch(cnn *net, const dataset *ds, size_t begin, size_t batch,
-                     const float *targets, int train, float learning_rate,
-                     float *loss_out) {
+                     const float *targets, int train, float *loss_out) {
     const size_t sample_size = ds->channels * ds->height * ds->width;
     const size_t shape[] = {batch, ds->channels, ds->height, ds->width};
     const size_t target_shape[] = {batch, ds->classes};
@@ -255,12 +265,14 @@ static int run_batch(cnn *net, const dataset *ds, size_t begin, size_t batch,
                                                  train);
     tc_tensor_nd *target = tc_tensor_nd_from_data(target_shape, 2, targets, 0);
     tc_tensor_nd *logits = cnn_forward(net, input);
-    tc_tensor_nd *loss = logits ? tc_tensor_nd_mse_loss(logits, target) : NULL;
-    const int ok = input && target && logits && loss &&
+    tc_tensor_nd *probs = logits ? tc_tensor_nd_softmax(logits) : NULL;
+    tc_tensor_nd *loss = probs ? tc_tensor_nd_cross_entropy(probs, target) : NULL;
+    const int ok = input && target && logits && probs && loss &&
                    (!train || tc_tensor_nd_backward(loss));
     if (ok && loss_out) *loss_out = tc_tensor_nd_const_data(loss)[0];
-    if (ok && train) cnn_step(net, learning_rate);
+    if (ok && train) cnn_train_step(net);
     tc_tensor_nd_free(loss);
+    tc_tensor_nd_free(probs);
     tc_tensor_nd_free(logits);
     tc_tensor_nd_free(target);
     tc_tensor_nd_free(input);
@@ -268,7 +280,7 @@ static int run_batch(cnn *net, const dataset *ds, size_t begin, size_t batch,
 }
 
 static int train_network(cnn *net, const dataset *ds, size_t batch_size,
-                         size_t epochs, float learning_rate) {
+                         size_t epochs) {
     const size_t batches = ds->count / batch_size;
     for (size_t epoch = 0; epoch < epochs; ++epoch) {
         const double start = now_ms();
@@ -279,7 +291,7 @@ static int train_network(cnn *net, const dataset *ds, size_t batch_size,
             float loss = 0.0f;
             const int ok = targets &&
                            run_batch(net, ds, begin, batch_size, targets, 1,
-                                     learning_rate, &loss);
+                                     &loss);
             free(targets);
             if (!ok) return 0;
             total += loss;
@@ -338,7 +350,7 @@ int main(int argc, char **argv) {
         features = conv2_filters * 7 * 7;
         batch_size = 64;
         epochs = 4;
-        learning_rate = 0.03f;
+        learning_rate = 0.001f;
         printf("MNIST: %zu entrenamiento, %zu prueba\n", train_set.count,
                test_set.count);
     } else {
@@ -352,22 +364,21 @@ int main(int argc, char **argv) {
         features = conv1_filters * 4 * 4;
         batch_size = 40;
         epochs = 30;
-        learning_rate = 0.1f;
+        learning_rate = 0.005f;
         printf("Dataset sintético: %zu entrenamiento, %zu prueba\n",
                train_set.count, test_set.count);
     }
 
     cnn net;
     if (!cnn_create(&net, 1, conv1_filters, conv2_filters, real_mnist,
-                    features, train_set.classes, 123u)) {
+                    features, train_set.classes, 123u, learning_rate)) {
         printf("No se pudo crear la red\n");
         dataset_free(&train_set);
         dataset_free(&test_set);
         return 2;
     }
     const double start = now_ms();
-    const int trained = train_network(&net, &train_set, batch_size, epochs,
-                                      learning_rate);
+    const int trained = train_network(&net, &train_set, batch_size, epochs);
     const double train_ms = now_ms() - start;
     const int acc = trained ? accuracy(&net, &test_set, batch_size) : -1;
     printf("Entrenamiento: %.1f ms total | Precisión en prueba: %d%%\n",

@@ -20,7 +20,9 @@ typedef enum {
     TC_ND_OP_SUM,
     TC_ND_OP_MSE,
     TC_ND_OP_RESHAPE,
-    TC_ND_OP_MAXPOOL2D
+    TC_ND_OP_MAXPOOL2D,
+    TC_ND_OP_SOFTMAX,
+    TC_ND_OP_CROSS_ENTROPY
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -458,6 +460,54 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     return result;
 }
 
+tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input) {
+    if (!input || input->ndim == 0 || input->shape[input->ndim - 1] == 0)
+        return NULL;
+    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+                                            TC_ND_OP_SOFTMAX,
+                                            (tc_tensor_nd *)input, NULL);
+    if (!result) return NULL;
+    const size_t classes = input->shape[input->ndim - 1];
+    const size_t rows = input->size / classes;
+    for (size_t r = 0; r < rows; ++r) {
+        const float *src = input->data + r * classes;
+        float *dst = result->data + r * classes;
+        float max_value = src[0];
+        for (size_t j = 1; j < classes; ++j)
+            if (src[j] > max_value) max_value = src[j];
+        float sum = 0.0f;
+        for (size_t j = 0; j < classes; ++j) {
+            dst[j] = expf(src[j] - max_value);
+            sum += dst[j];
+        }
+        for (size_t j = 0; j < classes; ++j)
+            dst[j] /= sum;
+    }
+    return result;
+}
+
+tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
+                                         const tc_tensor_nd *target) {
+    if (!same_shape(prediction, target) || prediction->ndim == 0 ||
+        prediction->shape[prediction->ndim - 1] == 0)
+        return NULL;
+    const size_t classes = prediction->shape[prediction->ndim - 1];
+    const size_t rows = prediction->size / classes;
+    const size_t shape[] = {1};
+    tc_tensor_nd *result = operation_result(shape, 1, TC_ND_OP_CROSS_ENTROPY,
+                                            (tc_tensor_nd *)prediction,
+                                            (tc_tensor_nd *)target);
+    if (!result) return NULL;
+    for (size_t r = 0; r < rows; ++r)
+        for (size_t j = 0; j < classes; ++j) {
+            const float p = prediction->data[r * classes + j];
+            result->data[0] -= target->data[r * classes + j] *
+                               logf(p > 1e-7f ? p : 1e-7f);
+        }
+    result->data[0] /= (float)rows;
+    return result;
+}
+
 tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
                                       const size_t *shape, size_t ndim) {
     size_t size = 0;
@@ -799,6 +849,32 @@ static void backward_node(tc_tensor_nd *tensor) {
                         }
             break;
         }
+        case TC_ND_OP_SOFTMAX: {
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            for (size_t r = 0; r < rows; ++r) {
+                const float *prob = tensor->data + r * classes;
+                const float *grad_out = tensor->grad + r * classes;
+                float dot = 0.0f;
+                for (size_t j = 0; j < classes; ++j)
+                    dot += grad_out[j] * prob[j];
+                for (size_t j = 0; j < classes; ++j)
+                    add_grad(a, r * classes + j,
+                             prob[j] * (grad_out[j] - dot));
+            }
+            break;
+        }
+        case TC_ND_OP_CROSS_ENTROPY: {
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            const float scale = tensor->grad[0] / (float)rows;
+            for (size_t i = 0; i < a->size; ++i) {
+                const float p = a->data[i] > 1e-7f ? a->data[i] : 1e-7f;
+                add_grad(a, i, -b->data[i] * scale / p);
+                add_grad(b, i, -logf(p) * scale);
+            }
+            break;
+        }
         case TC_ND_OP_SUM:
             for (size_t i = 0; i < a->size; ++i) add_grad(a, i, tensor->grad[0]);
             break;
@@ -921,4 +997,82 @@ tc_tensor_nd *tc_conv2d_layer_kernel(tc_conv2d_layer *layer) {
 
 tc_tensor_nd *tc_conv2d_layer_bias(tc_conv2d_layer *layer) {
     return layer ? layer->bias : NULL;
+}
+
+struct tc_tensor_nd_optimizer {
+    tc_tensor_nd **params;
+    float **m;
+    float **v;
+    size_t count;
+    float learning_rate;
+    unsigned long step_count;
+};
+
+tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
+                                                    size_t count,
+                                                    float learning_rate) {
+    if (!params && count > 0) return NULL;
+    tc_tensor_nd_optimizer *optimizer =
+        (tc_tensor_nd_optimizer *)calloc(1, sizeof(*optimizer));
+    if (!optimizer) return NULL;
+    optimizer->params = (tc_tensor_nd **)calloc(count, sizeof(*params));
+    optimizer->m = (float **)calloc(count, sizeof(float *));
+    optimizer->v = (float **)calloc(count, sizeof(float *));
+    if ((count > 0) &&
+        (!optimizer->params || !optimizer->m || !optimizer->v)) {
+        tc_tensor_nd_optimizer_free(optimizer);
+        return NULL;
+    }
+    optimizer->count = count;
+    for (size_t i = 0; i < count; ++i) {
+        optimizer->params[i] = params[i];
+        const size_t numel = params[i] ? tc_tensor_nd_numel(params[i]) : 0;
+        optimizer->m[i] = (float *)calloc(numel, sizeof(float));
+        optimizer->v[i] = (float *)calloc(numel, sizeof(float));
+        if (!optimizer->m[i] || !optimizer->v[i]) {
+            tc_tensor_nd_optimizer_free(optimizer);
+            return NULL;
+        }
+    }
+    optimizer->learning_rate = learning_rate;
+    optimizer->step_count = 0;
+    return optimizer;
+}
+
+int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
+    if (!optimizer) return 0;
+    const float beta1 = 0.9f, beta2 = 0.999f, epsilon = 1e-8f;
+    optimizer->step_count += 1;
+    const float bias1 = 1.0f - powf(beta1, (float)optimizer->step_count);
+    const float bias2 = 1.0f - powf(beta2, (float)optimizer->step_count);
+    int updated = 0;
+    for (size_t i = 0; i < optimizer->count; ++i) {
+        tc_tensor_nd *param = optimizer->params[i];
+        if (!param || !param->grad) continue;
+        float *m = optimizer->m[i];
+        float *v = optimizer->v[i];
+        for (size_t j = 0; j < param->size; ++j) {
+            const float grad = param->grad[j];
+            m[j] = beta1 * m[j] + (1.0f - beta1) * grad;
+            v[j] = beta2 * v[j] + (1.0f - beta2) * grad * grad;
+            const float m_hat = m[j] / bias1;
+            const float v_hat = v[j] / bias2;
+            param->data[j] -=
+                optimizer->learning_rate * m_hat / (sqrtf(v_hat) + epsilon);
+        }
+        ++updated;
+    }
+    return updated;
+}
+
+void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer) {
+    if (!optimizer) return;
+    for (size_t i = 0; i < optimizer->count; ++i) {
+        free(optimizer->m ? optimizer->m[i] : NULL);
+        free(optimizer->v ? optimizer->v[i] : NULL);
+    }
+    free(optimizer->m);
+    free(optimizer->v);
+    free(optimizer->params);
+    free(optimizer);
 }

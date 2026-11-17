@@ -2,7 +2,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.7 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, ReLU, suma y pérdida MSE. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. Todavía no incluye GPU ni importación de modelos de TensorFlow.
+La versión 0.8 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, suma y pérdida MSE, además de una capa convolucional de alto nivel con inicialización Xavier y pasos SGD. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -128,6 +128,30 @@ En una medición de referencia con entrada `[8,3,32,32]`, kernel `[16,3,3,3]`, s
 
 La salida de C coincidió con NumPy con un error máximo de `4.8e-06`. Los tiempos pueden variar según el equipo.
 
+## Capa convolucional y ejemplo CNN
+
+`tc_conv2d_layer` encapsula kernel y sesgo entrenables con inicialización Xavier determinista. El forward aplica la convolución y suma el sesgo `[1, filtros, 1, 1]` por broadcasting; los gradientes llegan a ambos parámetros y `tc_tensor_nd_sgd_step` aplica el paso de optimización:
+
+```c
+tc_conv2d_options options = {1, 1, 1, 1};
+tc_conv2d_layer *conv = tc_conv2d_layer_create(1, 8, 3, 3, options, 42);
+tc_tensor_nd *features = tc_conv2d_layer_forward(conv, batch); /* conv + sesgo */
+/* ... pérdida y backward ... */
+tc_tensor_nd_sgd_step(tc_conv2d_layer_kernel(conv), 0.01f);
+tc_tensor_nd_sgd_step(tc_conv2d_layer_bias(conv), 0.01f);
+tc_conv2d_layer_free(conv);
+```
+
+El ejemplo [examples/cnn_mnist.c](examples/cnn_mnist.c) arma una CNN completa —conv(3×3) → ReLU → maxpool(2) → conv(3×3) → ReLU → maxpool(2) → aplanar → matmul + sesgo → MSE contra one-hot— y la entrena en C puro:
+
+```sh
+./build/tensorc_cnn_mnist            # dataset sintético determinista
+./build/tensorc_cnn_mnist train-images.idx3-ubyte train-labels.idx1-ubyte \
+                        t10k-images.idx3-ubyte t10k-labels.idx1-ubyte   # MNIST real
+```
+
+En una medición de referencia en MacBook Pro M1, el modo sintético (800 imágenes 8×8, 30 épocas) entrenó en ~270 ms con 80 % de precisión en prueba; con MNIST real (8 192 imágenes de entrenamiento, 4 épocas, lotes de 64) obtuvo 71 % de precisión en 2 048 imágenes de prueba en ~9.8 s de entrenamiento.
+
 ## Ejemplo Fahrenheit a Celsius
 
 `examples/fahrenheit.c` y `examples/fahrenheit.py` entrenan la misma red lineal con 2,049 muestras normalizadas, 500 épocas, minibatches de 64, la misma inicialización y la misma tasa de aprendizaje. Ambos imprimen el tiempo de entrenamiento y convierten 100 °F:
@@ -184,7 +208,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.5: serialización binaria versionada de modelos densos.
 - 0.6: convolución 2D válida con gradientes para entrada y kernels.
 - 0.7: stride y padding configurables en Conv2D, ruta im2col+GEMM para convoluciones grandes en Accelerate, y benchmark reproducible contra NumPy.
-- Siguientes pasos: capas convolucionales completas (agrupamiento, apilamiento de capas) y GPU.
+- 0.8: capa convolucional de alto nivel, max pooling y reshape en el grafo, pasos SGD, y ejemplo CNN entrenable en C puro con MNIST (IDX) o dataset sintético.
+- Siguientes pasos: optimizadores sobre listas de parámetros (Adam), más operaciones (softmax/cross-entropy, dropout) y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

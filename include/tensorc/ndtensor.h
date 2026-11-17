@@ -68,6 +68,16 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
                                      const tc_tensor_nd *kernel,
                                      tc_conv2d_options options);
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input);
+/* Reshapes as a graph operation; the total element count must match. */
+tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
+                                      const size_t *shape, size_t ndim);
+/*
+ * Non-overlapping max pooling over the spatial axes of a [N,C,H,W] tensor.
+ * Both H and W must be divisible by the pool size; the output is
+ * [N, C, H/pool_h, W/pool_w].
+ */
+tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
+                                     size_t pool_h, size_t pool_w);
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input);
 tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
                                     const tc_tensor_nd *target);
@@ -75,6 +85,26 @@ tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
 /* Runs reverse-mode autodiff from a scalar loss. Returns 1 on success. */
 int tc_tensor_nd_backward(tc_tensor_nd *loss);
 void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name);
+
+/* Applies one SGD update: data -= learning_rate * grad. */
+void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate);
+
+/*
+ * High-level 2D convolution layer: kernel [K,C,KH,KW] plus bias [1,K,1,1],
+ * both trainable. The kernel uses Xavier uniform initialization scaled by
+ * sqrt(6 / (fan_in + fan_out)); the seed makes creation deterministic.
+ */
+typedef struct tc_conv2d_layer tc_conv2d_layer;
+tc_conv2d_layer *tc_conv2d_layer_create(size_t in_channels, size_t out_channels,
+                                        size_t kernel_h, size_t kernel_w,
+                                        tc_conv2d_options options,
+                                        unsigned int seed);
+void tc_conv2d_layer_free(tc_conv2d_layer *layer);
+/* Forward pass: conv2d_ex(input, kernel, options) + bias (broadcast). */
+tc_tensor_nd *tc_conv2d_layer_forward(tc_conv2d_layer *layer,
+                                      const tc_tensor_nd *input);
+tc_tensor_nd *tc_conv2d_layer_kernel(tc_conv2d_layer *layer);
+tc_tensor_nd *tc_conv2d_layer_bias(tc_conv2d_layer *layer);
 
 #ifdef __cplusplus
 }

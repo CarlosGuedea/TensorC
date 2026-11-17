@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0 — capa convolucional y ejemplo CNN
+
+- Nueva operación de grafo `tc_tensor_nd_maxpool2d` (ventanas no traslapadas) con gradiente hacia el máximo de cada ventana.
+- Nueva operación de grafo `tc_tensor_nd_reshape_to` para aplanar tensores dentro del grafo de autodiferenciación.
+- `tc_conv2d_layer`: kernel y sesgo entrenables con inicialización Xavier determinista; el forward aplica convolución + sesgo con broadcasting.
+- `tc_tensor_nd_sgd_step` aplica un paso de SGD sobre cualquier tensor con gradiente.
+- Ejemplo `tensorc_cnn_mnist`: CNN completa (conv → ReLU → maxpool → … → matmul + sesgo → MSE) entrenable en C puro; carga MNIST en formato IDX cuando se le pasan los archivos y usa un dataset sintético determinista como respaldo.
+- Pruebas de valores, gradientes por diferencias finitas y entrenamiento end-to-end de la capa.
+
 ## 0.7.0 — Conv2D con stride y padding
 
 - Se agregó `tc_tensor_nd_conv2d_ex` con opciones de stride y padding simétrico de ceros (`tc_conv2d_options`); `tc_tensor_nd_conv2d` se conserva como stride 1 / sin padding.

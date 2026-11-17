@@ -18,7 +18,9 @@ typedef enum {
     TC_ND_OP_CONV2D,
     TC_ND_OP_RELU,
     TC_ND_OP_SUM,
-    TC_ND_OP_MSE
+    TC_ND_OP_MSE,
+    TC_ND_OP_RESHAPE,
+    TC_ND_OP_MAXPOOL2D
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -456,6 +458,57 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     return result;
 }
 
+tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
+                                      const size_t *shape, size_t ndim) {
+    size_t size = 0;
+    if (!input || !checked_product(shape, ndim, &size) || size != input->size)
+        return NULL;
+    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_RESHAPE,
+                                            (tc_tensor_nd *)input, NULL);
+    if (!result) return NULL;
+    memcpy(result->data, input->data, input->size * sizeof(float));
+    return result;
+}
+
+tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
+                                     size_t pool_h, size_t pool_w) {
+    if (!input || input->ndim != 4 || pool_h == 0 || pool_w == 0 ||
+        input->shape[2] % pool_h != 0 || input->shape[3] % pool_w != 0)
+        return NULL;
+    const size_t output_shape[] = {
+        input->shape[0], input->shape[1],
+        input->shape[2] / pool_h, input->shape[3] / pool_w
+    };
+    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_MAXPOOL2D,
+                                            (tc_tensor_nd *)input, NULL);
+    if (!result) return NULL;
+
+    const size_t batch = input->shape[0];
+    const size_t channels = input->shape[1];
+    const size_t input_height = input->shape[2];
+    const size_t input_width = input->shape[3];
+    const size_t output_height = result->shape[2];
+    const size_t output_width = result->shape[3];
+    for (size_t n = 0; n < batch; ++n)
+        for (size_t c = 0; c < channels; ++c)
+            for (size_t oh = 0; oh < output_height; ++oh)
+                for (size_t ow = 0; ow < output_width; ++ow) {
+                    float best = -INFINITY;
+                    const size_t row0 = oh * pool_h;
+                    const size_t col0 = ow * pool_w;
+                    for (size_t ph = 0; ph < pool_h; ++ph)
+                        for (size_t pw = 0; pw < pool_w; ++pw) {
+                            const float value = input->data[
+                                (((n * channels + c) * input_height + row0 + ph) *
+                                 input_width + col0 + pw)];
+                            if (value > best) best = value;
+                        }
+                    result->data[(((n * channels + c) * output_height + oh) *
+                                  output_width + ow)] = best;
+                }
+    return result;
+}
+
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input) {
     if (!input) return NULL;
     const size_t shape[] = {1};
@@ -709,6 +762,43 @@ static void backward_node(tc_tensor_nd *tensor) {
             for (size_t i = 0; i < a->size; ++i)
                 add_grad(a, i, a->data[i] > 0.0f ? tensor->grad[i] : 0.0f);
             break;
+        case TC_ND_OP_RESHAPE:
+            for (size_t i = 0; i < a->size; ++i)
+                add_grad(a, i, tensor->grad[i]);
+            break;
+        case TC_ND_OP_MAXPOOL2D: {
+            const size_t pool_h = a->shape[2] / tensor->shape[2];
+            const size_t pool_w = a->shape[3] / tensor->shape[3];
+            const size_t batch = a->shape[0];
+            const size_t channels = a->shape[1];
+            const size_t input_height = a->shape[2];
+            const size_t input_width = a->shape[3];
+            const size_t output_height = tensor->shape[2];
+            const size_t output_width = tensor->shape[3];
+            for (size_t n = 0; n < batch; ++n)
+                for (size_t c = 0; c < channels; ++c)
+                    for (size_t oh = 0; oh < output_height; ++oh)
+                        for (size_t ow = 0; ow < output_width; ++ow) {
+                            const size_t row0 = oh * pool_h;
+                            const size_t col0 = ow * pool_w;
+                            size_t best_index = 0;
+                            float best = -INFINITY;
+                            for (size_t ph = 0; ph < pool_h; ++ph)
+                                for (size_t pw = 0; pw < pool_w; ++pw) {
+                                    const size_t index =
+                                        (((n * channels + c) * input_height + row0 + ph) *
+                                         input_width + col0 + pw);
+                                    if (a->data[index] > best) {
+                                        best = a->data[index];
+                                        best_index = index;
+                                    }
+                                }
+                            add_grad(a, best_index,
+                                     tensor->grad[(((n * channels + c) * output_height + oh) *
+                                                   output_width + ow)]);
+                        }
+            break;
+        }
         case TC_ND_OP_SUM:
             for (size_t i = 0; i < a->size; ++i) add_grad(a, i, tensor->grad[0]);
             break;
@@ -752,4 +842,83 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name) {
     printf("] values=");
     for (size_t i = 0; i < tensor->size; ++i) printf("%s%.5f", i ? ", " : "[", tensor->data[i]);
     printf("]\n");
+}
+
+void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate) {
+    if (!param || !param->grad) return;
+    for (size_t i = 0; i < param->size; ++i)
+        param->data[i] -= learning_rate * param->grad[i];
+}
+
+/* Generador xorshift32 determinista para la inicialización de capas. */
+static unsigned int layer_rng_next(unsigned int *state) {
+    unsigned int x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+struct tc_conv2d_layer {
+    tc_tensor_nd *kernel;
+    tc_tensor_nd *bias;
+    tc_conv2d_options options;
+};
+
+tc_conv2d_layer *tc_conv2d_layer_create(size_t in_channels, size_t out_channels,
+                                        size_t kernel_h, size_t kernel_w,
+                                        tc_conv2d_options options,
+                                        unsigned int seed) {
+    if (in_channels == 0 || out_channels == 0 || kernel_h == 0 || kernel_w == 0)
+        return NULL;
+    tc_conv2d_layer *layer = (tc_conv2d_layer *)calloc(1, sizeof(*layer));
+    if (!layer) return NULL;
+    const size_t kernel_shape[] = {out_channels, in_channels, kernel_h, kernel_w};
+    const size_t bias_shape[] = {1, out_channels, 1, 1};
+    layer->kernel = tc_tensor_nd_create(kernel_shape, 4, 1);
+    layer->bias = tc_tensor_nd_create(bias_shape, 4, 1);
+    if (!layer->kernel || !layer->bias) {
+        tc_conv2d_layer_free(layer);
+        return NULL;
+    }
+    layer->options = options;
+
+    /* Xavier uniforme: limit = sqrt(6 / (fan_in + fan_out)). */
+    const float fan_in = (float)(in_channels * kernel_h * kernel_w);
+    const float fan_out = (float)(out_channels * kernel_h * kernel_w);
+    const float limit = sqrtf(6.0f / (fan_in + fan_out));
+    unsigned int state = seed ? seed : 1u;
+    float *kernel_data = tc_tensor_nd_data(layer->kernel);
+    for (size_t i = 0; i < tc_tensor_nd_numel(layer->kernel); ++i) {
+        const float unit = (float)layer_rng_next(&state) / 4294967296.0f;
+        kernel_data[i] = (2.0f * unit - 1.0f) * limit;
+    }
+    return layer;
+}
+
+void tc_conv2d_layer_free(tc_conv2d_layer *layer) {
+    if (!layer) return;
+    tc_tensor_nd_free(layer->kernel);
+    tc_tensor_nd_free(layer->bias);
+    free(layer);
+}
+
+tc_tensor_nd *tc_conv2d_layer_forward(tc_conv2d_layer *layer,
+                                      const tc_tensor_nd *input) {
+    if (!layer || !input) return NULL;
+    tc_tensor_nd *convolved = tc_tensor_nd_conv2d_ex(input, layer->kernel,
+                                                     layer->options);
+    if (!convolved) return NULL;
+    tc_tensor_nd *output = tc_tensor_nd_add(convolved, layer->bias);
+    tc_tensor_nd_free(convolved);
+    return output;
+}
+
+tc_tensor_nd *tc_conv2d_layer_kernel(tc_conv2d_layer *layer) {
+    return layer ? layer->kernel : NULL;
+}
+
+tc_tensor_nd *tc_conv2d_layer_bias(tc_conv2d_layer *layer) {
+    return layer ? layer->bias : NULL;
 }

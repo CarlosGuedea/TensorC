@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+/xor
+/tensorc_xor

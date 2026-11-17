@@ -1,0 +1,3 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/TensorCTargets.cmake")
+check_required_components(TensorC)

@@ -14,6 +14,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <tensorc/tensorc.h>
@@ -315,6 +316,16 @@ static PyObject *tensor_avgpool2d(TensorObject *self, PyObject *args) {
         tc_tensor_nd_avgpool2d(self->tensor, pool_h, pool_w));
 }
 
+static PyObject *tensor_save(TensorObject *self, PyObject *args) {
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path)) return NULL;
+    if (!tc_tensor_nd_save(self->tensor, path)) {
+        PyErr_SetString(PyExc_IOError, "no se pudo guardar el tensor");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *tensor_reshape(TensorObject *self, PyObject *args) {
     PyObject *shape_obj;
     if (!PyArg_ParseTuple(args, "O", &shape_obj)) return NULL;
@@ -500,6 +511,8 @@ static PyMethodDef tensor_methods[] = {
      "maxpool2d(pool_h, pool_w)"},
     {"avgpool2d", (PyCFunction)tensor_avgpool2d, METH_VARARGS,
      "avgpool2d(pool_h, pool_w)"},
+    {"save", (PyCFunction)tensor_save, METH_VARARGS,
+     "save(path) -> guarda el tensor en un archivo binario."},
     {"reshape", (PyCFunction)tensor_reshape, METH_VARARGS, "reshape(shape)"},
     {"conv2d", (PyCFunction)tensor_conv2d, METH_VARARGS | METH_KEYWORDS,
      "conv2d(kernel, stride=(1,1), padding=(0,0))"},
@@ -630,6 +643,104 @@ static PyTypeObject LayerType = {
     .tp_doc = "Trainable 2D convolution layer.",
 };
 
+/* Guarda un Tensor o una secuencia de Tensors como checkpoint. */
+static PyObject *module_save(PyObject *self, PyObject *args) {
+    (void)self;
+    PyObject *obj;
+    const char *path;
+    if (!PyArg_ParseTuple(args, "Os", &obj, &path)) return NULL;
+
+    PyObject *seq = NULL;
+    if (PyObject_TypeCheck(obj, &TensorType)) {
+        const tc_tensor_nd *single[] = {((TensorObject *)obj)->tensor};
+        if (!tc_save_checkpoint(single, 1, path)) {
+            PyErr_SetString(PyExc_IOError, "no se pudo guardar el checkpoint");
+            return NULL;
+        }
+        Py_RETURN_NONE;
+    }
+    seq = PySequence_Fast(obj, "se esperaba un Tensor o una secuencia de Tensors");
+    if (!seq) return NULL;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    const tc_tensor_nd **tensors =
+        (const tc_tensor_nd **)malloc((size_t)(n > 0 ? n : 1) * sizeof(*tensors));
+    if (!tensors) {
+        Py_DECREF(seq);
+        return PyErr_NoMemory();
+    }
+    int valid = 1;
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        tensors[i] = as_tensor(PySequence_Fast_GET_ITEM(seq, i));
+        if (!tensors[i]) {
+            valid = 0;
+            break;
+        }
+    }
+    const int saved =
+        valid && tc_save_checkpoint(tensors, (size_t)n, path);
+    free(tensors);
+    Py_DECREF(seq);
+    if (!saved) {
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_IOError, "no se pudo guardar el checkpoint");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+/* Carga un tensor único o un checkpoint; devuelve Tensor o lista de Tensors. */
+static PyObject *module_load(PyObject *self, PyObject *args,
+                             PyObject *kwargs) {
+    (void)self;
+    static char *names[] = {"path", "requires_grad", NULL};
+    const char *path;
+    int requires_grad = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|p", names, &path,
+                                     &requires_grad))
+        return NULL;
+
+    char magic[8];
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        PyErr_SetString(PyExc_FileNotFoundError, path);
+        return NULL;
+    }
+    const size_t got = fread(magic, 1, sizeof(magic), file);
+    fclose(file);
+
+    if (got == sizeof(magic) && memcmp(magic, "TCND0001", 8) == 0)
+        return (PyObject *)tensor_wrap(tc_tensor_nd_load(path, requires_grad));
+    if (got == sizeof(magic) && memcmp(magic, "TCKP0001", 8) == 0) {
+        size_t count = 0;
+        tc_tensor_nd **loaded = tc_load_checkpoint(path, &count, requires_grad);
+        if (!loaded) {
+            PyErr_SetString(PyExc_RuntimeError, "archivo de checkpoint inválido");
+            return NULL;
+        }
+        PyObject *list = PyList_New((Py_ssize_t)count);
+        if (!list) {
+            tc_free_checkpoint(loaded, count);
+            return NULL;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            TensorObject *item = tensor_wrap(loaded[i]);
+            if (!item) {
+                /* tensor_wrap ya liberó loaded[i] ante fallo. */
+                for (size_t j = i + 1; j < count; ++j)
+                    tc_tensor_nd_free(loaded[j]);
+                free(loaded);
+                Py_DECREF(list);
+                return NULL;
+            }
+            PyList_SET_ITEM(list, (Py_ssize_t)i, (PyObject *)item);
+        }
+        free(loaded);
+        return list;
+    }
+    PyErr_SetString(PyExc_RuntimeError, "archivo no reconocible como tensorc");
+    return NULL;
+}
+
 /* Definida más abajo; declaración anticipada para la tabla de métodos. */
 static PyObject *module_sinusoidal_positions(PyObject *self, PyObject *args);
 
@@ -637,6 +748,10 @@ static PyMethodDef module_methods[] = {
     {"sinusoidal_positions", (PyCFunction)module_sinusoidal_positions,
      METH_VARARGS,
      "sinusoidal_positions(seq, depth) -> codificación posicional [seq, depth]."},
+    {"save", (PyCFunction)module_save, METH_VARARGS,
+     "save(tensor_o_lista, path) -> guarda un checkpoint binario."},
+    {"load", (PyCFunction)module_load, METH_VARARGS | METH_KEYWORDS,
+     "load(path, requires_grad=False) -> Tensor o lista de Tensors."},
     {NULL, NULL, 0, NULL}
 };
 

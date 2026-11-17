@@ -1,6 +1,7 @@
 #include <tensorc/ndtensor.h>
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2167,4 +2168,138 @@ tc_tensor_nd *tc_transformer_block_forward(tc_transformer_block *block,
     tc_tensor_nd_free(h1);
     tc_tensor_nd_free(x2);
     return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Serialización binaria de tensores N-D.                              */
+/*                                                                     */
+/* Formatos (enteros de 64 bits y float32 en orden de bytes del host): */
+/*   tensor único:  magic "TCND0001" | ndim | shape[ndim] | datos      */
+/*   checkpoint:    magic "TCKP0001" | count | tensor × count          */
+/* Los gradientes no se guardan; al cargar se elige requires_grad.     */
+/* ------------------------------------------------------------------ */
+
+#define TC_ND_SAVE_MAGIC_TENSOR "TCND0001"
+#define TC_ND_SAVE_MAGIC_CHECKPOINT "TCKP0001"
+
+static int write_u64(FILE *file, uint64_t value) {
+    return fwrite(&value, sizeof(value), 1, file) == 1;
+}
+
+static int read_u64(FILE *file, uint64_t *value) {
+    return fread(value, sizeof(*value), 1, file) == 1;
+}
+
+static int write_tensor_payload(FILE *file, const tc_tensor_nd *tensor) {
+    if (!write_u64(file, (uint64_t)tensor->ndim)) return 0;
+    for (size_t i = 0; i < tensor->ndim; ++i)
+        if (!write_u64(file, (uint64_t)tensor->shape[i])) return 0;
+    return fwrite(tensor->data, sizeof(float), tensor->size, file) ==
+           tensor->size;
+}
+
+/* Lee la forma y los datos de un tensor; devuelve el tensor listo o
+ * NULL si el archivo está truncado, es corrupto o no hay memoria. */
+static tc_tensor_nd *read_tensor_payload(FILE *file, int requires_grad) {
+    uint64_t ndim = 0;
+    if (!read_u64(file, &ndim) || ndim == 0 || ndim > 8) return NULL;
+    size_t shape[8];
+    for (size_t i = 0; i < (size_t)ndim; ++i) {
+        uint64_t dim = 0;
+        if (!read_u64(file, &dim) || dim == 0 ||
+            dim > (uint64_t)((size_t)-1)) {
+            return NULL;
+        }
+        shape[i] = (size_t)dim;
+    }
+    size_t size = 0;
+    if (!checked_product(shape, (size_t)ndim, &size)) return NULL;
+    float *data = (float *)malloc(size * sizeof(float));
+    if (!data) return NULL;
+    if (fread(data, sizeof(float), size, file) != size) {
+        free(data);
+        return NULL;
+    }
+    tc_tensor_nd *tensor =
+        tc_tensor_nd_from_data(shape, (size_t)ndim, data, requires_grad);
+    free(data);
+    return tensor;
+}
+
+int tc_tensor_nd_save(const tc_tensor_nd *tensor, const char *path) {
+    if (!tensor || !path) return 0;
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    int ok = fwrite(TC_ND_SAVE_MAGIC_TENSOR, 1, 8, file) == 8 &&
+             write_tensor_payload(file, tensor);
+    if (fclose(file) != 0) ok = 0;
+    return ok;
+}
+
+tc_tensor_nd *tc_tensor_nd_load(const char *path, int requires_grad) {
+    if (!path) return NULL;
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    char magic[8];
+    tc_tensor_nd *tensor = NULL;
+    if (fread(magic, 1, 8, file) == 8 &&
+        memcmp(magic, TC_ND_SAVE_MAGIC_TENSOR, 8) == 0)
+        tensor = read_tensor_payload(file, requires_grad);
+    fclose(file);
+    return tensor;
+}
+
+int tc_save_checkpoint(const tc_tensor_nd *const *tensors, size_t count,
+                       const char *path) {
+    if ((!tensors && count > 0) || !path) return 0;
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    int ok = fwrite(TC_ND_SAVE_MAGIC_CHECKPOINT, 1, 8, file) == 8 &&
+             write_u64(file, (uint64_t)count);
+    for (size_t i = 0; ok && i < count; ++i)
+        ok = tensors[i] && write_tensor_payload(file, tensors[i]);
+    if (fclose(file) != 0) ok = 0;
+    return ok;
+}
+
+tc_tensor_nd **tc_load_checkpoint(const char *path, size_t *count,
+                                  int requires_grad) {
+    if (count) *count = 0;
+    if (!path) return NULL;
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    char magic[8];
+    tc_tensor_nd **tensors = NULL;
+    uint64_t saved_count = 0;
+    if (fread(magic, 1, 8, file) != 8 ||
+        memcmp(magic, TC_ND_SAVE_MAGIC_CHECKPOINT, 8) != 0 ||
+        !read_u64(file, &saved_count) || saved_count > (uint64_t)SIZE_MAX) {
+        fclose(file);
+        return NULL;
+    }
+    tensors = (tc_tensor_nd **)calloc((size_t)saved_count + 1,
+                                      sizeof(*tensors));
+    if (!tensors) {
+        fclose(file);
+        return NULL;
+    }
+    size_t loaded = 0;
+    for (; loaded < (size_t)saved_count; ++loaded) {
+        tensors[loaded] = read_tensor_payload(file, requires_grad);
+        if (!tensors[loaded]) {
+            tc_free_checkpoint(tensors, loaded);
+            fclose(file);
+            return NULL;
+        }
+    }
+    fclose(file);
+    if (count) *count = loaded;
+    return tensors;
+}
+
+void tc_free_checkpoint(tc_tensor_nd **tensors, size_t count) {
+    if (!tensors) return;
+    for (size_t i = 0; i < count; ++i)
+        tc_tensor_nd_free(tensors[i]);
+    free(tensors);
 }

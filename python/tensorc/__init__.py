@@ -12,6 +12,8 @@ from ._tensorc import (
     LSTMLayer,
     Tensor,
     TransformerBlock,
+    load,
+    save,
     sinusoidal_positions,
 )
 
@@ -24,6 +26,8 @@ __all__ = [
     "LSTMLayer",
     "TransformerBlock",
     "Adam",
+    "load",
+    "save",
     "sinusoidal_positions",
     "__version__",
 ]

@@ -135,6 +135,26 @@ tc_tensor_nd *tc_tensor_nd_multihead_attention(const tc_tensor_nd *query,
 /* Codificación posicional sinusoidal [seq, depth] (hoja constante). */
 tc_tensor_nd *tc_tensor_nd_sinusoidal_positions(size_t seq, size_t depth);
 
+/*
+ * Serialización binaria de tensores N-D (formato propio, versionado,
+ * documentado en ndtensor.c). Guarda ndim, shape y datos — nunca
+ * gradientes —, así sirve para persistir pesos entrenados. Los enteros
+ * son de 64 bits y los datos float32, en orden de bytes del host.
+ * Devuelven 0/NULL si el archivo no existe o está corrupto.
+ */
+int tc_tensor_nd_save(const tc_tensor_nd *tensor, const char *path);
+tc_tensor_nd *tc_tensor_nd_load(const char *path, int requires_grad);
+/*
+ * Checkpoint: varios tensores en un solo archivo (la lista de parámetros
+ * de un modelo, p. ej.). tc_load_checkpoint devuelve un arreglo de
+ * `count` tensores que hay que liberar con tc_free_checkpoint.
+ */
+int tc_save_checkpoint(const tc_tensor_nd *const *tensors, size_t count,
+                       const char *path);
+tc_tensor_nd **tc_load_checkpoint(const char *path, size_t *count,
+                                  int requires_grad);
+void tc_free_checkpoint(tc_tensor_nd **tensors, size_t count);
+
 /* Runs reverse-mode autodiff from a scalar loss. Returns 1 on success. */
 int tc_tensor_nd_backward(tc_tensor_nd *loss);
 void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name);

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.0 — sigmoid, tanh y capa densa
+
+- Nuevas operaciones de grafo `tc_tensor_nd_sigmoid` (rama estable según el signo, sin NaN/inf en entradas extremas) y `tc_tensor_nd_tanh`, ambas con gradiente analítico validado por diferencias finitas.
+- Nueva capa de alto nivel `tc_dense_layer`: peso [in, out] y sesgo [1, out] entrenables, Xavier uniforme determinista; el forward hace matmul + sesgo con broadcasting sobre la dimensión de batch.
+- Rechazo de formas inválidas: la entrada del forward debe ser rango 2 con in_features columnas.
+- Bindings de Python: métodos `sigmoid`/`tanh` en `Tensor` y nueva clase `DenseLayer` (props `weight`/`bias`, método `forward`).
+- Nueva prueba `tensorc_dense_layer`: valores conocidos, gradientes analíticos de entrada/peso/sesgo, estabilidad numérica de sigmoid, rechazos y entrenamiento end-to-end (la capa aprende y = 2x − 1 por SGD).
+- Suite: 8/8 en Accelerate y 8/8 en el backend genérico.
+
 ## 0.10.0 — bindings de Python (paquete `tensorc` en pip)
 
 - Nuevo módulo de extensión CPython escrito en C11 (`python/tensorc/_tensorc.c`) sobre el mismo núcleo del repo: sin C++, sin ctypes, sin dependencias externas más allá de CPython y NumPy (solo como formato de intercambio).

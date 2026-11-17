@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.10.0 LANGUAGES C)
+project(TensorC VERSION 0.11.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
@@ -78,6 +78,9 @@ if(BUILD_TESTING)
     add_executable(tensorc_test_optimizers tests/test_optimizers.c)
     target_link_libraries(tensorc_test_optimizers PRIVATE TensorC::tensorc)
     add_test(NAME tensorc_optimizers COMMAND tensorc_test_optimizers)
+    add_executable(tensorc_test_dense_layer tests/test_dense_layer.c)
+    target_link_libraries(tensorc_test_dense_layer PRIVATE TensorC::tensorc)
+    add_test(NAME tensorc_dense_layer COMMAND tensorc_test_dense_layer)
 endif()
 
 include(GNUInstallDirs)

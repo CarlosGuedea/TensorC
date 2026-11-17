@@ -281,6 +281,16 @@ static PyObject *tensor_relu(TensorObject *self, PyObject *args) {
     return (PyObject *)tensor_wrap(tc_tensor_nd_relu(self->tensor));
 }
 
+static PyObject *tensor_sigmoid(TensorObject *self, PyObject *args) {
+    (void)args;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_sigmoid(self->tensor));
+}
+
+static PyObject *tensor_tanh(TensorObject *self, PyObject *args) {
+    (void)args;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_tanh(self->tensor));
+}
+
 static PyObject *tensor_softmax(TensorObject *self, PyObject *args) {
     (void)args;
     return (PyObject *)tensor_wrap(tc_tensor_nd_softmax(self->tensor));
@@ -342,6 +352,9 @@ static PyMethodDef tensor_methods[] = {
     {"mul", (PyCFunction)tensor_mul, METH_VARARGS, "Elementwise multiply."},
     {"matmul", (PyCFunction)tensor_matmul, METH_VARARGS, "Matrix multiply."},
     {"relu", (PyCFunction)tensor_relu, METH_NOARGS, "ReLU."},
+    {"sigmoid", (PyCFunction)tensor_sigmoid, METH_NOARGS,
+     "Sigmoid (numerically stable)."},
+    {"tanh", (PyCFunction)tensor_tanh, METH_NOARGS, "Hyperbolic tangent."},
     {"softmax", (PyCFunction)tensor_softmax, METH_NOARGS,
      "Softmax over the last dimension."},
     {"sum", (PyCFunction)tensor_sum, METH_NOARGS, "Sum of all elements."},
@@ -468,6 +481,85 @@ static PyMethodDef module_methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
+/* --- Capa densa --- */
+typedef struct {
+    PyObject_HEAD
+    tc_dense_layer *layer;
+} DenseLayerObject;
+
+static PyTypeObject DenseLayerType;
+
+static void dense_layer_dealloc(DenseLayerObject *self) {
+    tc_dense_layer_free(self->layer);
+    PyObject_Del(self);
+}
+
+static PyObject *dense_layer_weight(DenseLayerObject *self, void *closure) {
+    (void)closure;
+    tc_tensor_nd_retain(tc_dense_layer_weight(self->layer));
+    return (PyObject *)tensor_wrap(tc_dense_layer_weight(self->layer));
+}
+
+static PyObject *dense_layer_bias(DenseLayerObject *self, void *closure) {
+    (void)closure;
+    tc_tensor_nd_retain(tc_dense_layer_bias(self->layer));
+    return (PyObject *)tensor_wrap(tc_dense_layer_bias(self->layer));
+}
+
+static PyObject *dense_layer_forward(DenseLayerObject *self, PyObject *args) {
+    PyObject *input_obj;
+    if (!PyArg_ParseTuple(args, "O", &input_obj)) return NULL;
+    tc_tensor_nd *input = as_tensor(input_obj);
+    if (!input) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_dense_layer_forward(self->layer, input));
+}
+
+static PyObject *dense_layer_new(PyTypeObject *type, PyObject *args,
+                                 PyObject *kwargs) {
+    static char *names[] = {"in_features", "out_features", "seed", NULL};
+    unsigned long in_features, out_features, seed = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "kk|k", names, &in_features,
+                                     &out_features, &seed))
+        return NULL;
+    DenseLayerObject *obj = PyObject_New(DenseLayerObject, &DenseLayerType);
+    if (!obj) return NULL;
+    obj->layer = tc_dense_layer_create(in_features, out_features,
+                                       (unsigned int)seed);
+    if (!obj->layer) {
+        PyObject_Del(obj);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "no se pudo crear la capa densa");
+        return NULL;
+    }
+    return (PyObject *)obj;
+}
+
+static PyMethodDef dense_layer_methods[] = {
+    {"forward", (PyCFunction)dense_layer_forward, METH_VARARGS,
+     "forward(input) -> matmul + bias"},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyGetSetDef dense_layer_getset[] = {
+    {"weight", (getter)dense_layer_weight, NULL, "Trainable weight tensor.",
+     NULL},
+    {"bias", (getter)dense_layer_bias, NULL, "Trainable bias tensor.", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyTypeObject DenseLayerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.DenseLayer",
+    .tp_basicsize = sizeof(DenseLayerObject),
+    .tp_dealloc = (destructor)dense_layer_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = dense_layer_methods,
+    .tp_getset = dense_layer_getset,
+    .tp_new = dense_layer_new,
+    .tp_doc = "Trainable fully-connected layer.",
+};
+
 /* --- Optimizador Adam --- */
 typedef struct {
     PyObject_HEAD
@@ -558,6 +650,7 @@ static struct PyModuleDef tensorc_module = {
 PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyType_Ready(&TensorType) < 0) return NULL;
     if (PyType_Ready(&LayerType) < 0) return NULL;
+    if (PyType_Ready(&DenseLayerType) < 0) return NULL;
     if (PyType_Ready(&OptimizerType) < 0) return NULL;
     PyObject *module = PyModule_Create(&tensorc_module);
     if (!module) return NULL;
@@ -570,6 +663,13 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     Py_INCREF(&LayerType);
     if (PyModule_AddObject(module, "Conv2DLayer", (PyObject *)&LayerType) < 0) {
         Py_DECREF(&LayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&DenseLayerType);
+    if (PyModule_AddObject(module, "DenseLayer",
+                           (PyObject *)&DenseLayerType) < 0) {
+        Py_DECREF(&DenseLayerType);
         Py_DECREF(module);
         return NULL;
     }

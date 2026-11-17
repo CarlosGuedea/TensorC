@@ -251,7 +251,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.8: capa convolucional de alto nivel, max pooling y reshape en el grafo, pasos SGD, y ejemplo CNN entrenable en C puro con MNIST (IDX) o dataset sintético.
 - 0.9: softmax y cross-entropy en el grafo, optimizador Adam sobre listas de parámetros; la CNN de ejemplo llega a 93 % en MNIST.
 - 0.10: bindings oficiales de Python: extensión CPython escrita en C11 sobre el mismo núcleo, instalable con `pip install ./python` y publicable en PyPI.
-- Siguientes pasos: capa densa de alto nivel, guardado/carga de la CNN y GPU.
+- 0.11: activaciones sigmoid y tanh en el grafo N-dim con autograd, capa densa de alto nivel (`tc_dense_layer` / `DenseLayer`) con inicialización Xavier determinista.
+- Siguientes pasos: guardado/carga de la CNN y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

@@ -68,6 +68,10 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
                                      const tc_tensor_nd *kernel,
                                      tc_conv2d_options options);
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input);
+/* Elementwise sigmoid: 1 / (1 + exp(-x)), numerically stable. */
+tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input);
+/* Elementwise hyperbolic tangent. */
+tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input);
 /* Softmax over the last dimension (one distribution per row). */
 tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input);
 /*
@@ -126,6 +130,22 @@ tc_tensor_nd *tc_conv2d_layer_forward(tc_conv2d_layer *layer,
                                       const tc_tensor_nd *input);
 tc_tensor_nd *tc_conv2d_layer_kernel(tc_conv2d_layer *layer);
 tc_tensor_nd *tc_conv2d_layer_bias(tc_conv2d_layer *layer);
+
+/*
+ * High-level fully-connected layer: weight [in_features, out_features] plus
+ * bias [1, out_features], both trainable. The weight uses Xavier uniform
+ * initialization scaled by sqrt(6 / (fan_in + fan_out)); the seed makes
+ * creation deterministic. The input must be rank 2: [batch, in_features].
+ */
+typedef struct tc_dense_layer tc_dense_layer;
+tc_dense_layer *tc_dense_layer_create(size_t in_features, size_t out_features,
+                                      unsigned int seed);
+void tc_dense_layer_free(tc_dense_layer *layer);
+/* Forward pass: matmul(input, weight) + bias (broadcast over rows). */
+tc_tensor_nd *tc_dense_layer_forward(tc_dense_layer *layer,
+                                     const tc_tensor_nd *input);
+tc_tensor_nd *tc_dense_layer_weight(tc_dense_layer *layer);
+tc_tensor_nd *tc_dense_layer_bias(tc_dense_layer *layer);
 
 #ifdef __cplusplus
 }

@@ -22,7 +22,9 @@ typedef enum {
     TC_ND_OP_RESHAPE,
     TC_ND_OP_MAXPOOL2D,
     TC_ND_OP_SOFTMAX,
-    TC_ND_OP_CROSS_ENTROPY
+    TC_ND_OP_CROSS_ENTROPY,
+    TC_ND_OP_SIGMOID,
+    TC_ND_OP_TANH
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -460,6 +462,33 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     return result;
 }
 
+tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input) {
+    if (!input) return NULL;
+    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+                                            TC_ND_OP_SIGMOID,
+                                            (tc_tensor_nd *)input, NULL);
+    if (!result) return NULL;
+    for (size_t i = 0; i < input->size; ++i) {
+        /* Rama estable según el signo: evita exp() de argumento positivo. */
+        const float x = input->data[i];
+        result->data[i] = x >= 0.0f
+            ? 1.0f / (1.0f + expf(-x))
+            : expf(x) / (1.0f + expf(x));
+    }
+    return result;
+}
+
+tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input) {
+    if (!input) return NULL;
+    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+                                            TC_ND_OP_TANH,
+                                            (tc_tensor_nd *)input, NULL);
+    if (!result) return NULL;
+    for (size_t i = 0; i < input->size; ++i)
+        result->data[i] = tanhf(input->data[i]);
+    return result;
+}
+
 tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input) {
     if (!input || input->ndim == 0 || input->shape[input->ndim - 1] == 0)
         return NULL;
@@ -812,6 +841,20 @@ static void backward_node(tc_tensor_nd *tensor) {
             for (size_t i = 0; i < a->size; ++i)
                 add_grad(a, i, a->data[i] > 0.0f ? tensor->grad[i] : 0.0f);
             break;
+        case TC_ND_OP_SIGMOID:
+            /* d sigmoid = y * (1 - y) evaluado en la salida. */
+            for (size_t i = 0; i < a->size; ++i) {
+                const float y = tensor->data[i];
+                add_grad(a, i, tensor->grad[i] * y * (1.0f - y));
+            }
+            break;
+        case TC_ND_OP_TANH:
+            /* d tanh = 1 - y^2 evaluado en la salida. */
+            for (size_t i = 0; i < a->size; ++i) {
+                const float y = tensor->data[i];
+                add_grad(a, i, tensor->grad[i] * (1.0f - y * y));
+            }
+            break;
         case TC_ND_OP_RESHAPE:
             for (size_t i = 0; i < a->size; ++i)
                 add_grad(a, i, tensor->grad[i]);
@@ -996,6 +1039,63 @@ tc_tensor_nd *tc_conv2d_layer_kernel(tc_conv2d_layer *layer) {
 }
 
 tc_tensor_nd *tc_conv2d_layer_bias(tc_conv2d_layer *layer) {
+    return layer ? layer->bias : NULL;
+}
+
+struct tc_dense_layer {
+    tc_tensor_nd *weight;
+    tc_tensor_nd *bias;
+};
+
+tc_dense_layer *tc_dense_layer_create(size_t in_features, size_t out_features,
+                                      unsigned int seed) {
+    if (in_features == 0 || out_features == 0) return NULL;
+    tc_dense_layer *layer = (tc_dense_layer *)calloc(1, sizeof(*layer));
+    if (!layer) return NULL;
+    const size_t weight_shape[] = {in_features, out_features};
+    const size_t bias_shape[] = {1, out_features};
+    layer->weight = tc_tensor_nd_create(weight_shape, 2, 1);
+    layer->bias = tc_tensor_nd_create(bias_shape, 2, 1);
+    if (!layer->weight || !layer->bias) {
+        tc_dense_layer_free(layer);
+        return NULL;
+    }
+
+    /* Xavier uniforme: limit = sqrt(6 / (fan_in + fan_out)). */
+    const float fan_in = (float)in_features;
+    const float fan_out = (float)out_features;
+    const float limit = sqrtf(6.0f / (fan_in + fan_out));
+    unsigned int state = seed ? seed : 1u;
+    float *weight_data = tc_tensor_nd_data(layer->weight);
+    for (size_t i = 0; i < tc_tensor_nd_numel(layer->weight); ++i) {
+        const float unit = (float)layer_rng_next(&state) / 4294967296.0f;
+        weight_data[i] = (2.0f * unit - 1.0f) * limit;
+    }
+    return layer;
+}
+
+void tc_dense_layer_free(tc_dense_layer *layer) {
+    if (!layer) return;
+    tc_tensor_nd_free(layer->weight);
+    tc_tensor_nd_free(layer->bias);
+    free(layer);
+}
+
+tc_tensor_nd *tc_dense_layer_forward(tc_dense_layer *layer,
+                                     const tc_tensor_nd *input) {
+    if (!layer || !input) return NULL;
+    tc_tensor_nd *z = tc_tensor_nd_matmul(input, layer->weight);
+    if (!z) return NULL;
+    tc_tensor_nd *output = tc_tensor_nd_add(z, layer->bias);
+    tc_tensor_nd_free(z);
+    return output;
+}
+
+tc_tensor_nd *tc_dense_layer_weight(tc_dense_layer *layer) {
+    return layer ? layer->weight : NULL;
+}
+
+tc_tensor_nd *tc_dense_layer_bias(tc_dense_layer *layer) {
     return layer ? layer->bias : NULL;
 }
 

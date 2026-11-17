@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.5.0 LANGUAGES C)
+project(TensorC VERSION 0.6.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_USE_ACCELERATE "Use Apple Accelerate for large matrix operations" ON)
@@ -61,6 +61,9 @@ if(BUILD_TESTING)
     add_executable(tensorc_test_serialization tests/test_serialization.c)
     target_link_libraries(tensorc_test_serialization PRIVATE TensorC::tensorc)
     add_test(NAME tensorc_serialization COMMAND tensorc_test_serialization)
+    add_executable(tensorc_test_conv2d tests/test_conv2d.c)
+    target_link_libraries(tensorc_test_conv2d PRIVATE TensorC::tensorc)
+    add_test(NAME tensorc_conv2d COMMAND tensorc_test_conv2d)
 endif()
 
 include(GNUInstallDirs)

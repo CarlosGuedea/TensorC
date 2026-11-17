@@ -10,6 +10,7 @@ typedef enum {
     TC_ND_OP_ADD,
     TC_ND_OP_MUL,
     TC_ND_OP_MATMUL,
+    TC_ND_OP_CONV2D,
     TC_ND_OP_RELU,
     TC_ND_OP_SUM,
     TC_ND_OP_MSE
@@ -268,6 +269,56 @@ tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) 
     return result;
 }
 
+tc_tensor_nd *tc_tensor_nd_conv2d(const tc_tensor_nd *input,
+                                   const tc_tensor_nd *kernel) {
+    if (!input || !kernel || input->ndim != 4 || kernel->ndim != 4 ||
+        input->shape[1] != kernel->shape[1] ||
+        input->shape[2] < kernel->shape[2] || input->shape[3] < kernel->shape[3])
+        return NULL;
+
+    const size_t output_shape[] = {
+        input->shape[0], kernel->shape[0],
+        input->shape[2] - kernel->shape[2] + 1,
+        input->shape[3] - kernel->shape[3] + 1
+    };
+    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_CONV2D,
+                                            (tc_tensor_nd *)input,
+                                            (tc_tensor_nd *)kernel);
+    if (!result) return NULL;
+
+    const size_t batch = input->shape[0];
+    const size_t input_channels = input->shape[1];
+    const size_t input_height = input->shape[2];
+    const size_t input_width = input->shape[3];
+    const size_t output_channels = kernel->shape[0];
+    const size_t kernel_height = kernel->shape[2];
+    const size_t kernel_width = kernel->shape[3];
+    const size_t output_height = result->shape[2];
+    const size_t output_width = result->shape[3];
+
+    for (size_t n = 0; n < batch; ++n)
+        for (size_t oc = 0; oc < output_channels; ++oc)
+            for (size_t oh = 0; oh < output_height; ++oh)
+                for (size_t ow = 0; ow < output_width; ++ow) {
+                    float value = 0.0f;
+                    for (size_t ic = 0; ic < input_channels; ++ic)
+                        for (size_t kh = 0; kh < kernel_height; ++kh)
+                            for (size_t kw = 0; kw < kernel_width; ++kw) {
+                                const size_t input_index =
+                                    (((n * input_channels + ic) * input_height + oh + kh) *
+                                     input_width + ow + kw);
+                                const size_t kernel_index =
+                                    (((oc * input_channels + ic) * kernel_height + kh) *
+                                     kernel_width + kw);
+                                value += input->data[input_index] * kernel->data[kernel_index];
+                            }
+                    const size_t output_index =
+                        (((n * output_channels + oc) * output_height + oh) * output_width + ow);
+                    result->data[output_index] = value;
+                }
+    return result;
+}
+
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     if (!input) return NULL;
     tc_tensor_nd *result = operation_result(input->shape, input->ndim, TC_ND_OP_RELU,
@@ -378,6 +429,41 @@ static void backward_node(tc_tensor_nd *tensor) {
                     add_grad(b, k * b->shape[1] + j, value);
                 }
             break;
+        case TC_ND_OP_CONV2D: {
+            const size_t batch = a->shape[0];
+            const size_t input_channels = a->shape[1];
+            const size_t input_height = a->shape[2];
+            const size_t input_width = a->shape[3];
+            const size_t output_channels = b->shape[0];
+            const size_t kernel_height = b->shape[2];
+            const size_t kernel_width = b->shape[3];
+            const size_t output_height = tensor->shape[2];
+            const size_t output_width = tensor->shape[3];
+            for (size_t n = 0; n < batch; ++n)
+                for (size_t oc = 0; oc < output_channels; ++oc)
+                    for (size_t oh = 0; oh < output_height; ++oh)
+                        for (size_t ow = 0; ow < output_width; ++ow) {
+                            const size_t output_index =
+                                (((n * output_channels + oc) * output_height + oh) *
+                                 output_width + ow);
+                            const float output_gradient = tensor->grad[output_index];
+                            for (size_t ic = 0; ic < input_channels; ++ic)
+                                for (size_t kh = 0; kh < kernel_height; ++kh)
+                                    for (size_t kw = 0; kw < kernel_width; ++kw) {
+                                        const size_t input_index =
+                                            (((n * input_channels + ic) * input_height + oh + kh) *
+                                             input_width + ow + kw);
+                                        const size_t kernel_index =
+                                            (((oc * input_channels + ic) * kernel_height + kh) *
+                                             kernel_width + kw);
+                                        add_grad(a, input_index,
+                                                 output_gradient * b->data[kernel_index]);
+                                        add_grad(b, kernel_index,
+                                                 output_gradient * a->data[input_index]);
+                                    }
+                        }
+            break;
+        }
         case TC_ND_OP_RELU:
             for (size_t i = 0; i < a->size; ++i)
                 add_grad(a, i, a->data[i] > 0.0f ? tensor->grad[i] : 0.0f);

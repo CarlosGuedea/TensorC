@@ -41,6 +41,9 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b);
 /* Matrix multiplication is currently defined for two rank-2 tensors. */
 tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a,
                                   const tc_tensor_nd *b);
+/* Valid 2D cross-correlation: input [N,C,H,W], kernel [K,C,KH,KW]. */
+tc_tensor_nd *tc_tensor_nd_conv2d(const tc_tensor_nd *input,
+                                   const tc_tensor_nd *kernel);
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input);
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input);
 tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,

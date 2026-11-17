@@ -2,7 +2,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.5 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, ReLU, suma y pérdida MSE. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y conserva un backend genérico para otras plataformas. Todavía no incluye GPU, convoluciones ni importación de modelos de TensorFlow.
+La versión 0.6 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D válida, ReLU, suma y pérdida MSE. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y conserva un backend genérico para otras plataformas. Todavía no incluye GPU ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -98,6 +98,16 @@ tc_model loaded = tc_model_load("modelo.tcm");
 
 El archivo incluye una firma y una versión de formato para rechazar archivos incompatibles. El formato está diseñado para guardar modelos TensorC en equipos compatibles; no es un formato de intercambio universal entre arquitecturas con distinto endianess o representación de `float`.
 
+## Convolución 2D
+
+La API incluye correlación 2D válida en CPU con tensores en formato `[lote, canales, alto, ancho]` y kernels `[filtros, canales, alto_kernel, ancho_kernel]`:
+
+```c
+tc_tensor_nd *features = tc_tensor_nd_conv2d(input, kernel);
+```
+
+La operación conserva el grafo de autodiferenciación y calcula gradientes para la entrada y el kernel. El sesgo puede agregarse como un tensor `[1, filtros, 1, 1]` usando broadcasting.
+
 ## Ejemplo Fahrenheit a Celsius
 
 `examples/fahrenheit.c` y `examples/fahrenheit.py` entrenan la misma red lineal con 2,049 muestras normalizadas, 500 épocas, minibatches de 64, la misma inicialización y la misma tasa de aprendizaje. Ambos imprimen el tiempo de entrenamiento y convierten 100 °F:
@@ -152,7 +162,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.3: tensores N-dimensionales, autodiferenciación, entrenamiento CPU optimizado y backend Accelerate para matmul.
 - 0.4: broadcasting en operaciones elemento a elemento y acumulación correcta de gradientes.
 - 0.5: serialización binaria versionada de modelos densos.
-- Siguientes pasos: capas convolucionales y backends acelerados.
+- 0.6: convolución 2D válida con gradientes para entrada y kernels.
+- Siguientes pasos: padding/stride configurables, capas convolucionales completas y GPU.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

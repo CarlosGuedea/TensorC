@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0 — convolución 2D en CPU
+
+- Se agregó `tc_tensor_nd_conv2d` para entrada `[N,C,H,W]` y kernels `[K,C,KH,KW]`.
+- La operación calcula gradientes automáticos para la entrada y los kernels.
+- Se agregó una prueba CTest de valores de salida y gradientes.
+
 ## 0.5.0 — serialización de modelos densos
 
 - Se agregaron `tc_model_save` y `tc_model_load`.

@@ -162,6 +162,55 @@ typedef struct {
     float **biases;
 } MTGradients;
 
+/* Reused forward/backward buffers; avoids heap traffic for every sample. */
+typedef struct {
+    size_t layer_count;
+    float **acts;
+    float **zs;
+    float **deltas;
+} MTWorkspace;
+
+static MTWorkspace workspace_create(const MTModel *model) {
+    MTWorkspace workspace = {0, NULL, NULL, NULL};
+    if (!model || !model->layers || model->layer_count == 0) return workspace;
+    workspace.layer_count = model->layer_count;
+    workspace.acts = (float **)calloc(workspace.layer_count + 1, sizeof(float *));
+    workspace.zs = (float **)calloc(workspace.layer_count, sizeof(float *));
+    workspace.deltas = (float **)calloc(workspace.layer_count, sizeof(float *));
+    if (!workspace.acts || !workspace.zs || !workspace.deltas) goto fail;
+    for (size_t l = 0; l < workspace.layer_count; ++l) {
+        const MTLayer *layer = &model->layers[l];
+        workspace.acts[l + 1] = (float *)malloc(layer->output_size * sizeof(float));
+        workspace.zs[l] = (float *)malloc(layer->output_size * sizeof(float));
+        workspace.deltas[l] = (float *)malloc(layer->output_size * sizeof(float));
+        if (!workspace.acts[l + 1] || !workspace.zs[l] || !workspace.deltas[l]) goto fail;
+    }
+    return workspace;
+fail:
+    for (size_t l = 0; l < workspace.layer_count; ++l) {
+        free(workspace.acts ? workspace.acts[l + 1] : NULL);
+        free(workspace.zs ? workspace.zs[l] : NULL);
+        free(workspace.deltas ? workspace.deltas[l] : NULL);
+    }
+    free(workspace.acts);
+    free(workspace.zs);
+    free(workspace.deltas);
+    return (MTWorkspace){0, NULL, NULL, NULL};
+}
+
+static void workspace_free(MTWorkspace *workspace) {
+    if (!workspace) return;
+    for (size_t l = 0; l < workspace->layer_count; ++l) {
+        free(workspace->acts[l + 1]);
+        free(workspace->zs[l]);
+        free(workspace->deltas[l]);
+    }
+    free(workspace->acts);
+    free(workspace->zs);
+    free(workspace->deltas);
+    *workspace = (MTWorkspace){0, NULL, NULL, NULL};
+}
+
 static MTGradients gradients_create(const MTModel *model) {
     MTGradients gradients = {0, NULL, NULL};
     if (!model || !model->layers || model->layer_count == 0) return gradients;
@@ -220,27 +269,22 @@ static void gradients_add(const MTModel *model, MTGradients *destination,
 }
 
 static float compute_gradients(const MTModel *model, const MTTensor *input,
-                               const MTTensor *target, MTGradients *gradients) {
+                               const MTTensor *target, MTGradients *gradients,
+                               MTWorkspace *workspace) {
     if (!valid_input(model, input) || !target || !target->data || target->rows != 1 ||
         target->cols != model->layers[model->layer_count - 1].output_size ||
-        !gradients || gradients->layer_count != model->layer_count) return NAN;
+        !gradients || gradients->layer_count != model->layer_count || !workspace ||
+        workspace->layer_count != model->layer_count) return NAN;
 
     const size_t L = model->layer_count;
-    float **acts = (float **)calloc(L + 1, sizeof(float *));
-    float **zs = (float **)calloc(L, sizeof(float *));
-    float **deltas = (float **)calloc(L, sizeof(float *));
-    if (!acts || !zs || !deltas) goto fail;
+    float **acts = workspace->acts;
+    float **zs = workspace->zs;
+    float **deltas = workspace->deltas;
     gradients_zero(model, gradients);
-    acts[0] = (float *)malloc(input->cols * sizeof(float));
-    if (!acts[0]) goto fail;
-    memcpy(acts[0], input->data, input->cols * sizeof(float));
+    acts[0] = input->data;
 
     for (size_t l = 0; l < L; ++l) {
         MTLayer *layer = &model->layers[l];
-        acts[l + 1] = (float *)malloc(layer->output_size * sizeof(float));
-        zs[l] = (float *)malloc(layer->output_size * sizeof(float));
-        deltas[l] = (float *)malloc(layer->output_size * sizeof(float));
-        if (!acts[l + 1] || !zs[l] || !deltas[l]) goto fail;
         for (size_t j = 0; j < layer->output_size; ++j) {
             float z = layer->biases[j];
             for (size_t i = 0; i < layer->input_size; ++i)
@@ -279,16 +323,7 @@ static float compute_gradients(const MTModel *model, const MTTensor *input,
             gradients->biases[l][j] = deltas[l][j];
     }
 
-    for (size_t l = 0; l <= L; ++l) free(acts[l]);
-    for (size_t l = 0; l < L; ++l) { free(zs[l]); free(deltas[l]); }
-    free(acts); free(zs); free(deltas);
     return loss;
-fail:
-    if (acts) { for (size_t l = 0; l <= L; ++l) free(acts[l]); }
-    if (zs) { for (size_t l = 0; l < L; ++l) free(zs[l]); }
-    if (deltas) { for (size_t l = 0; l < L; ++l) free(deltas[l]); }
-    free(acts); free(zs); free(deltas);
-    return NAN;
 }
 
 MTOptimizer mt_optimizer_sgd(float learning_rate) {
@@ -391,10 +426,16 @@ float mt_model_train_sample_opt(MTModel *model, const MTTensor *input,
                                 const MTTensor *target, MTOptimizer *optimizer) {
     if (!optimizer_valid(model, optimizer)) return NAN;
     MTGradients gradients = gradients_create(model);
-    if (!gradients.weights) return NAN;
-    const float loss = compute_gradients(model, input, target, &gradients);
+    MTWorkspace workspace = workspace_create(model);
+    if (!gradients.weights || !workspace.acts) {
+        gradients_free(&gradients);
+        workspace_free(&workspace);
+        return NAN;
+    }
+    const float loss = compute_gradients(model, input, target, &gradients, &workspace);
     if (!isnan(loss)) apply_gradients(model, &gradients, optimizer, 1.0f);
     gradients_free(&gradients);
+    workspace_free(&workspace);
     return loss;
 }
 
@@ -413,11 +454,10 @@ float mt_model_train_batch(MTModel *model, const MTTensor *x,
     if (batch_size > x->rows) batch_size = x->rows;
     MTGradients accumulated = gradients_create(model);
     MTGradients sample = gradients_create(model);
-    MTTensor xi = mt_tensor_create(1, x->cols);
-    MTTensor yi = mt_tensor_create(1, y->cols);
-    if (!accumulated.weights || !sample.weights || !xi.data || !yi.data) {
+    MTWorkspace workspace = workspace_create(model);
+    if (!accumulated.weights || !sample.weights || !workspace.acts) {
         gradients_free(&accumulated); gradients_free(&sample);
-        mt_tensor_free(&xi); mt_tensor_free(&yi);
+        workspace_free(&workspace);
         return NAN;
     }
     float total_loss = 0.0f;
@@ -427,12 +467,12 @@ float mt_model_train_batch(MTModel *model, const MTTensor *x,
         gradients_zero(model, &accumulated);
         for (size_t offset = 0; offset < count; ++offset) {
             const size_t row = processed + offset;
-            memcpy(xi.data, &x->data[row * x->cols], x->cols * sizeof(float));
-            memcpy(yi.data, &y->data[row * y->cols], y->cols * sizeof(float));
-            const float loss = compute_gradients(model, &xi, &yi, &sample);
+            const MTTensor xi = {1, x->cols, &x->data[row * x->cols]};
+            const MTTensor yi = {1, y->cols, &y->data[row * y->cols]};
+            const float loss = compute_gradients(model, &xi, &yi, &sample, &workspace);
             if (isnan(loss)) {
                 gradients_free(&accumulated); gradients_free(&sample);
-                mt_tensor_free(&xi); mt_tensor_free(&yi);
+                workspace_free(&workspace);
                 return NAN;
             }
             total_loss += loss;
@@ -442,7 +482,7 @@ float mt_model_train_batch(MTModel *model, const MTTensor *x,
         processed += count;
     }
     gradients_free(&accumulated); gradients_free(&sample);
-    mt_tensor_free(&xi); mt_tensor_free(&yi);
+    workspace_free(&workspace);
     return total_loss / (float)x->rows;
 }
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.3.0 LANGUAGES C)
+project(TensorC VERSION 0.3.1 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 

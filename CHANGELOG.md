@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 — optimización del entrenamiento CPU
+
+- Reutilización de buffers de activaciones, valores intermedios y deltas durante el entrenamiento.
+- Eliminación de copias temporales de cada fila del dataset mediante vistas de memoria.
+- El benchmark Fahrenheit→Celsius pasó de aproximadamente 169.77 ms a 19.96 ms.
+- En la misma prueba, C fue aproximadamente 4.0 veces más rápido que Python puro.
+
 ## 0.3.0 — tensores N-dimensionales y autodiferenciación
 
 - API pública `tc_tensor_nd` para tensores N-dimensionales en formato row-major.

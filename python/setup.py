@@ -18,8 +18,10 @@ if sys.platform == "darwin":
     define_macros.append(("TENSORC_HAS_ACCELERATE", "1"))
     define_macros.append(("ACCELERATE_NEW_LAPACK", "1"))
     extra_link_args.extend(["-framework", "Accelerate"])
-else:
+elif sys.platform.startswith("linux"):
     libraries.append("m")
+# En Windows la biblioteca matemática va incluida en el CRT: no enlazar
+# "m" (no existe m.lib y LNK1181 lo rechaza).
 
 extension = Extension(
     "tensorc._tensorc",

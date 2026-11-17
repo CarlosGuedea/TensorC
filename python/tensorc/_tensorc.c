@@ -326,6 +326,19 @@ static PyObject *tensor_save(TensorObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *tensor_copy_(TensorObject *self, PyObject *args) {
+    PyObject *src_obj;
+    if (!PyArg_ParseTuple(args, "O", &src_obj)) return NULL;
+    tc_tensor_nd *src = as_tensor(src_obj);
+    if (!src) return NULL;
+    if (!tc_tensor_nd_copy_(self->tensor, src)) {
+        PyErr_SetString(PyExc_ValueError,
+                        "copy_ requiere tensores con la misma forma");
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *tensor_reshape(TensorObject *self, PyObject *args) {
     PyObject *shape_obj;
     if (!PyArg_ParseTuple(args, "O", &shape_obj)) return NULL;
@@ -513,6 +526,8 @@ static PyMethodDef tensor_methods[] = {
      "avgpool2d(pool_h, pool_w)"},
     {"save", (PyCFunction)tensor_save, METH_VARARGS,
      "save(path) -> guarda el tensor en un archivo binario."},
+    {"copy_", (PyCFunction)tensor_copy_, METH_VARARGS,
+     "copy_(src) -> copia los datos de src (misma forma); no toca gradientes."},
     {"reshape", (PyCFunction)tensor_reshape, METH_VARARGS, "reshape(shape)"},
     {"conv2d", (PyCFunction)tensor_conv2d, METH_VARARGS | METH_KEYWORDS,
      "conv2d(kernel, stride=(1,1), padding=(0,0))"},

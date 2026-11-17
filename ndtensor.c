@@ -170,6 +170,14 @@ void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor) {
     if (tensor && tensor->grad) memset(tensor->grad, 0, tensor->size * sizeof(float));
 }
 
+int tc_tensor_nd_copy_(tc_tensor_nd *dst, const tc_tensor_nd *src) {
+    if (!dst || !src || dst->ndim != src->ndim) return 0;
+    for (size_t i = 0; i < dst->ndim; ++i)
+        if (dst->shape[i] != src->shape[i]) return 0;
+    memcpy(dst->data, src->data, src->size * sizeof(float));
+    return 1;
+}
+
 int tc_tensor_nd_reshape(tc_tensor_nd *tensor, const size_t *shape,
                          size_t ndim) {
     size_t size = 0;

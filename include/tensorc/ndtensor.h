@@ -30,6 +30,8 @@ const float *tc_tensor_nd_const_data(const tc_tensor_nd *tensor);
 const float *tc_tensor_nd_grad(const tc_tensor_nd *tensor);
 int tc_tensor_nd_requires_grad(const tc_tensor_nd *tensor);
 void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor);
+/* Copia los datos de src en dst (misma forma exacta); no toca gradientes. */
+int tc_tensor_nd_copy_(tc_tensor_nd *dst, const tc_tensor_nd *src);
 
 /* Reshape is metadata-only and preserves the number of elements. */
 int tc_tensor_nd_reshape(tc_tensor_nd *tensor, const size_t *shape,

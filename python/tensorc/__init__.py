@@ -16,6 +16,7 @@ from ._tensorc import (
     save,
     sinusoidal_positions,
 )
+from .model import Model
 
 __version__ = "0.13.1"
 
@@ -26,6 +27,7 @@ __all__ = [
     "LSTMLayer",
     "TransformerBlock",
     "Adam",
+    "Model",
     "load",
     "save",
     "sinusoidal_positions",

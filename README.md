@@ -1,8 +1,8 @@
 # TensorC
 
-TensorC es un framework de redes neuronales pequeño escrito en C11. Esta primera versión ofrece tensores 2D, suma y multiplicación de matrices, redes densas, activaciones lineal/ReLU/sigmoide/tanh, retropropagación, error cuadrático medio e SGD. No requiere Python ni dependencias de terceros.
+TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.1 está enfocada en CPU y en modelos densos pequeños. Aún no incluye autodiferenciación general, GPU, convoluciones ni importación de modelos de TensorFlow.
+La versión 0.3 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, multiplicación de matrices 2D, ReLU, suma y pérdida MSE. Todavía no incluye GPU, convoluciones, broadcasting ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -51,6 +51,34 @@ tc_optimizer_free(&optimizer);
 
 El ejemplo `examples/xor_adam.c` usa Adam con un minibatch de cuatro muestras.
 
+## Tensores N-dimensionales y autodiferenciación
+
+La API nueva se incluye desde `<tensorc/tensorc.h>` y usa punteros opacos. Los resultados conservan sus padres mediante conteo de referencias, por lo que se pueden liberar los tensores de entrada después de construir una operación:
+
+```c
+const size_t shape[] = {2, 2};
+const float values[] = {1, -2, 3, 4};
+tc_tensor_nd *x = tc_tensor_nd_from_data(shape, 2, values, 1);
+tc_tensor_nd *y = tc_tensor_nd_relu(x);
+tc_tensor_nd *loss = tc_tensor_nd_sum(y);
+
+tc_tensor_nd_backward(loss);
+printf("d(loss)/dx[0] = %f\n", tc_tensor_nd_grad(x)[0]);
+
+tc_tensor_nd_free(loss);
+tc_tensor_nd_free(y);
+tc_tensor_nd_free(x);
+```
+
+El ejemplo completo está en [examples/autograd.c](examples/autograd.c) y la prueba de gradientes en [tests/test_autograd.c](tests/test_autograd.c). Para ejecutar las pruebas:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/tensorc_autograd
+```
+
 ## Usarlo desde otro proyecto CMake
 
 Después de instalar TensorC, agrega el directorio de instalación a `CMAKE_PREFIX_PATH`, enlaza `TensorC::tensorc` e incluye `<tensorc/tensorc.h>`.
@@ -64,8 +92,9 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 ## Estado del proyecto
 
 - 0.1: CPU, tensores 2D, capas densas y SGD.
-- 0.2 en desarrollo: acumulación de gradientes por minibatch y Adam.
-- Siguientes pasos: serialización, gradientes de operaciones tensoriales y backends acelerados.
+- 0.2: acumulación de gradientes por minibatch y Adam.
+- 0.3: tensores N-dimensionales y autodiferenciación para operaciones tensoriales básicas.
+- Siguientes pasos: broadcasting, serialización, capas convolucionales y backends acelerados.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

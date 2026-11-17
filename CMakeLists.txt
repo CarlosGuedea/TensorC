@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.1.0 LANGUAGES C)
+project(TensorC VERSION 0.3.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 
-add_library(tensorc minitf.c)
+add_library(tensorc minitf.c ndtensor.c)
 add_library(TensorC::tensorc ALIAS tensorc)
 target_compile_features(tensorc PUBLIC c_std_11)
 target_include_directories(tensorc
@@ -29,6 +29,15 @@ if(TENSORC_BUILD_EXAMPLES)
     target_link_libraries(tensorc_xor PRIVATE TensorC::tensorc)
     add_executable(tensorc_xor_adam examples/xor_adam.c)
     target_link_libraries(tensorc_xor_adam PRIVATE TensorC::tensorc)
+    add_executable(tensorc_autograd examples/autograd.c)
+    target_link_libraries(tensorc_autograd PRIVATE TensorC::tensorc)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(tensorc_test_autograd tests/test_autograd.c)
+    target_link_libraries(tensorc_test_autograd PRIVATE TensorC::tensorc)
+    add_test(NAME tensorc_autograd COMMAND tensorc_test_autograd)
 endif()
 
 include(GNUInstallDirs)
@@ -50,6 +59,7 @@ install(TARGETS tensorc EXPORT TensorCTargets
     PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tensorc
 )
 install(FILES minitf.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES include/tensorc/ndtensor.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tensorc)
 install(EXPORT TensorCTargets NAMESPACE TensorC:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TensorC)
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/TensorCConfig.cmake

@@ -1,14 +1,15 @@
 #ifndef TENSORC_TENSORC_H
 #define TENSORC_TENSORC_H
 
-/* TensorC 0.1 public API. This release focuses on CPU dense neural networks. */
+/* TensorC public API: compatible dense models plus N-dimensional autograd. */
 #include <minitf.h>
+#include <tensorc/ndtensor.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define TENSORC_VERSION "0.1.0"
+#define TENSORC_VERSION "0.3.0"
 
 typedef MTTensor tc_tensor;
 typedef MTActivation tc_activation;

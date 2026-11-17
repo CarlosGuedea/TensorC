@@ -7,3 +7,4 @@ cmake-build-*/
 *.dll
 /xor
 /tensorc_xor
+/graphify-out/

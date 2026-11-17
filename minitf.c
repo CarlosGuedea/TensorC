@@ -1,9 +1,14 @@
 #include "minitf.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef TENSORC_HAS_ACCELERATE
+#include <Accelerate/Accelerate.h>
+#endif
 
 static unsigned int rng_state = 1u;
 
@@ -41,6 +46,18 @@ MTTensor mt_tensor_matmul(const MTTensor *a, const MTTensor *b) {
     if (!a || !b || !a->data || !b->data || a->cols != b->rows) return out;
     out = mt_tensor_create(a->rows, b->cols);
     if (!out.data) return out;
+#ifdef TENSORC_HAS_ACCELERATE
+    const size_t work = a->rows * a->cols * b->cols;
+    if (work >= 4096 && a->rows <= (size_t)INT_MAX && a->cols <= (size_t)INT_MAX &&
+        b->cols <= (size_t)INT_MAX) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    (int)a->rows, (int)b->cols, (int)a->cols,
+                    1.0f, a->data, (int)a->cols,
+                    b->data, (int)b->cols,
+                    0.0f, out.data, (int)out.cols);
+        return out;
+    }
+#endif
     for (size_t i = 0; i < a->rows; ++i)
         for (size_t k = 0; k < a->cols; ++k) {
             const float value = a->data[i * a->cols + k];

@@ -2,7 +2,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
 
-La versión 0.3 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, multiplicación de matrices 2D, ReLU, suma y pérdida MSE. Todavía no incluye GPU, convoluciones, broadcasting ni importación de modelos de TensorFlow.
+La versión 0.3 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencias y gradientes automáticos para suma, producto elemento a elemento, multiplicación de matrices 2D, ReLU, suma y pérdida MSE. En macOS usa Apple Accelerate para multiplicaciones grandes y conserva un backend genérico para otras plataformas. Todavía no incluye GPU, convoluciones, broadcasting ni importación de modelos de TensorFlow.
 
 ## Compilar
 
@@ -97,6 +97,25 @@ El tiempo de C mide el entrenamiento dentro del proceso; el de Python usa `perf_
 
 La mejora proviene de reutilizar los buffers internos y evitar copias de cada muestra. Los tiempos pueden variar según el equipo y la versión del compilador.
 
+## Backend Accelerate y benchmark de matrices
+
+En macOS, CMake enlaza automáticamente el framework Apple Accelerate cuando está disponible. Las matrices pequeñas siguen usando el backend genérico para evitar la sobrecarga de una llamada BLAS; las operaciones grandes usan `cblas_sgemm`.
+
+```sh
+./build/tensorc_matmul_benchmark
+```
+
+Para probar el backend genérico en macOS, configura otra carpeta con `-DTENSORC_USE_ACCELERATE=OFF` y compara ambos ejecutables. En Linux y Windows el backend genérico se mantiene sin dependencias adicionales.
+
+En una medición de referencia con matrices 512×512 y ocho repeticiones, la mediana de siete ejecuciones fue:
+
+| Backend | Mediana | Mejora |
+|---|---:|---:|
+| Genérico | 80.897 ms | 1x |
+| Apple Accelerate | 1.778 ms | 45.5x más rápido |
+
+El benchmark mide tiempo de CPU del proceso y los resultados conservaron el mismo checksum (`0.272000`).
+
 ## Usarlo desde otro proyecto CMake
 
 Después de instalar TensorC, agrega el directorio de instalación a `CMAKE_PREFIX_PATH`, enlaza `TensorC::tensorc` e incluye `<tensorc/tensorc.h>`.
@@ -111,7 +130,7 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 
 - 0.1: CPU, tensores 2D, capas densas y SGD.
 - 0.2: acumulación de gradientes por minibatch y Adam.
-- 0.3: tensores N-dimensionales, autodiferenciación y entrenamiento CPU optimizado.
+- 0.3: tensores N-dimensionales, autodiferenciación, entrenamiento CPU optimizado y backend Accelerate para matmul.
 - Siguientes pasos: broadcasting, serialización, capas convolucionales y backends acelerados.
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.

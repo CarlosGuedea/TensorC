@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — backend Accelerate para álgebra lineal
+
+- Uso opcional de Apple Accelerate/BLAS para multiplicaciones grandes de matrices.
+- Backend genérico conservado para macOS sin Accelerate, Linux y Windows.
+- Umbral para evitar la sobrecarga BLAS en matrices pequeñas.
+- Benchmark `tensorc_matmul_benchmark` y prueba de exactitud `tensorc_matmul`.
+- En la prueba 512×512, Accelerate obtuvo una mediana de 1.778 ms frente a 80.897 ms del backend genérico.
+
 ## 0.3.1 — optimización del entrenamiento CPU
 
 - Reutilización de buffers de activaciones, valores intermedios y deltas durante el entrenamiento.

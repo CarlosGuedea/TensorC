@@ -341,6 +341,91 @@ static PyObject *tensor_conv2d(TensorObject *self, PyObject *args,
         tc_tensor_nd_conv2d_ex(self->tensor, kernel, options));
 }
 
+static PyObject *tensor_slice_axis(TensorObject *self, PyObject *args) {
+    size_t axis, start, length;
+    if (!PyArg_ParseTuple(args, "nnn", &axis, &start, &length)) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_tensor_nd_slice_axis(self->tensor, axis, start, length));
+}
+
+static PyObject *tensor_transpose(TensorObject *self, PyObject *args) {
+    (void)args;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_transpose(self->tensor));
+}
+
+static PyObject *tensor_layer_norm(TensorObject *self, PyObject *args) {
+    (void)args;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_layer_norm(self->tensor));
+}
+
+/* concat(others, axis=0): others es un Tensor o una secuencia de Tensor.
+   self se concatena primero, seguido de los elementos de others. */
+static PyObject *tensor_concat(TensorObject *self, PyObject *args,
+                               PyObject *kwargs) {
+    static char *names[] = {"others", "axis", NULL};
+    PyObject *others_obj;
+    size_t axis = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|n", names, &others_obj,
+                                     &axis))
+        return NULL;
+
+    int is_single = PyObject_TypeCheck(others_obj, &TensorType);
+    PyObject *seq = is_single ? NULL
+        : PySequence_Fast(others_obj,
+                          "others debe ser un Tensor o una secuencia");
+    const Py_ssize_t extra = is_single ? 1
+                                       : PySequence_Fast_GET_SIZE(seq);
+    if (!is_single && extra < 0) {
+        Py_DECREF(seq);
+        return NULL;
+    }
+    tc_tensor_nd **items = (tc_tensor_nd **)PyMem_Malloc(
+        (size_t)(extra + 1) * sizeof(*items));
+    if (!items) {
+        Py_XDECREF(seq);
+        return PyErr_NoMemory();
+    }
+    items[0] = self->tensor;
+    if (is_single) {
+        items[1] = as_tensor(others_obj);
+        if (!items[1]) {
+            PyMem_Free(items);
+            return NULL;
+        }
+    } else {
+        for (Py_ssize_t i = 0; i < extra; ++i) {
+            items[i + 1] = as_tensor(PySequence_Fast_GET_ITEM(seq, i));
+            if (!items[i + 1]) {
+                PyMem_Free(items);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+    }
+    tc_tensor_nd *result =
+        tc_tensor_nd_concat((const tc_tensor_nd *const *)items,
+                            (size_t)(extra + 1), axis);
+    PyMem_Free(items);
+    Py_XDECREF(seq);
+    return (PyObject *)tensor_wrap(result);
+}
+
+static PyObject *tensor_attention(TensorObject *self, PyObject *args,
+                                  PyObject *kwargs) {
+    static char *names[] = {"key", "value", "causal", NULL};
+    PyObject *key_obj, *value_obj;
+    int causal = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|p", names, &key_obj,
+                                     &value_obj, &causal))
+        return NULL;
+    tc_tensor_nd *key = as_tensor(key_obj);
+    if (!key) return NULL;
+    tc_tensor_nd *value = as_tensor(value_obj);
+    if (!value) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_tensor_nd_attention(self->tensor, key, value, causal));
+}
+
 static PyMethodDef tensor_methods[] = {
     {"zeros", (PyCFunction)tensor_zeros, METH_VARARGS | METH_KEYWORDS | METH_CLASS,
      "Tensor.zeros(shape, requires_grad=False)"},
@@ -366,6 +451,17 @@ static PyMethodDef tensor_methods[] = {
     {"reshape", (PyCFunction)tensor_reshape, METH_VARARGS, "reshape(shape)"},
     {"conv2d", (PyCFunction)tensor_conv2d, METH_VARARGS | METH_KEYWORDS,
      "conv2d(kernel, stride=(1,1), padding=(0,0))"},
+    {"slice_axis", (PyCFunction)tensor_slice_axis, METH_VARARGS,
+     "slice_axis(axis, start, length)"},
+    {"transpose", (PyCFunction)tensor_transpose, METH_NOARGS,
+     "Transposición de matriz [M, N] -> [N, M]."},
+    {"layer_norm", (PyCFunction)tensor_layer_norm, METH_NOARGS,
+     "LayerNorm sobre la última dimensión (sin afín)."},
+    {"concat", (PyCFunction)tensor_concat, METH_VARARGS | METH_KEYWORDS,
+     "concat(others, axis=0): others es un Tensor o secuencia de Tensor."},
+    {"attention", (PyCFunction)tensor_attention,
+     METH_VARARGS | METH_KEYWORDS,
+     "attention(key, value, causal=False) sobre [batch, seq, depth]."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -560,6 +656,93 @@ static PyTypeObject DenseLayerType = {
     .tp_doc = "Trainable fully-connected layer.",
 };
 
+/* --- Capa LSTM --- */
+typedef struct {
+    PyObject_HEAD
+    tc_lstm_layer *layer;
+} LSTMLayerObject;
+
+static PyTypeObject LSTMLayerType;
+
+static void lstm_layer_dealloc(LSTMLayerObject *self) {
+    tc_lstm_layer_free(self->layer);
+    PyObject_Del(self);
+}
+
+static PyObject *lstm_layer_weight_ih(LSTMLayerObject *self, void *closure) {
+    (void)closure;
+    tc_tensor_nd_retain(tc_lstm_layer_weight_ih(self->layer));
+    return (PyObject *)tensor_wrap(tc_lstm_layer_weight_ih(self->layer));
+}
+
+static PyObject *lstm_layer_weight_hh(LSTMLayerObject *self, void *closure) {
+    (void)closure;
+    tc_tensor_nd_retain(tc_lstm_layer_weight_hh(self->layer));
+    return (PyObject *)tensor_wrap(tc_lstm_layer_weight_hh(self->layer));
+}
+
+static PyObject *lstm_layer_bias(LSTMLayerObject *self, void *closure) {
+    (void)closure;
+    tc_tensor_nd_retain(tc_lstm_layer_bias(self->layer));
+    return (PyObject *)tensor_wrap(tc_lstm_layer_bias(self->layer));
+}
+
+/* forward(x): x es [seq, batch, in] (time-major); devuelve [seq, batch, hidden]. */
+static PyObject *lstm_layer_forward(LSTMLayerObject *self, PyObject *args) {
+    PyObject *input_obj;
+    if (!PyArg_ParseTuple(args, "O", &input_obj)) return NULL;
+    tc_tensor_nd *input = as_tensor(input_obj);
+    if (!input) return NULL;
+    return (PyObject *)tensor_wrap(tc_lstm_layer_forward(self->layer, input));
+}
+
+static PyObject *lstm_layer_new(PyTypeObject *type, PyObject *args,
+                                PyObject *kwargs) {
+    static char *names[] = {"in_features", "hidden", "seed", NULL};
+    unsigned long in_features, hidden, seed = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "kk|k", names, &in_features,
+                                     &hidden, &seed))
+        return NULL;
+    LSTMLayerObject *obj = PyObject_New(LSTMLayerObject, &LSTMLayerType);
+    if (!obj) return NULL;
+    obj->layer = tc_lstm_layer_create(in_features, hidden, (unsigned int)seed);
+    if (!obj->layer) {
+        PyObject_Del(obj);
+        PyErr_SetString(PyExc_RuntimeError, "no se pudo crear la capa LSTM");
+        return NULL;
+    }
+    return (PyObject *)obj;
+}
+
+static PyMethodDef lstm_layer_methods[] = {
+    {"forward", (PyCFunction)lstm_layer_forward, METH_VARARGS,
+     "forward(x) con x [seq, batch, in] -> [seq, batch, hidden]"},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyGetSetDef lstm_layer_getset[] = {
+    {"weight_ih", (getter)lstm_layer_weight_ih, NULL,
+     "Pesos entrada->puertas [4*hidden, in].", NULL},
+    {"weight_hh", (getter)lstm_layer_weight_hh, NULL,
+     "Pesos oculta->puertas [4*hidden, hidden].", NULL},
+    {"bias", (getter)lstm_layer_bias, NULL, "Sesgo de puertas [1, 4*hidden].",
+     NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyTypeObject LSTMLayerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.LSTMLayer",
+    .tp_basicsize = sizeof(LSTMLayerObject),
+    .tp_dealloc = (destructor)lstm_layer_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = lstm_layer_methods,
+    .tp_getset = lstm_layer_getset,
+    .tp_new = lstm_layer_new,
+    .tp_doc = "LSTM sobre una secuencia completa [seq, batch, in] "
+              "(time-major, h0/c0 en cero).",
+};
+
 /* --- Optimizador Adam --- */
 typedef struct {
     PyObject_HEAD
@@ -651,6 +834,7 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyType_Ready(&TensorType) < 0) return NULL;
     if (PyType_Ready(&LayerType) < 0) return NULL;
     if (PyType_Ready(&DenseLayerType) < 0) return NULL;
+    if (PyType_Ready(&LSTMLayerType) < 0) return NULL;
     if (PyType_Ready(&OptimizerType) < 0) return NULL;
     PyObject *module = PyModule_Create(&tensorc_module);
     if (!module) return NULL;
@@ -670,6 +854,13 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyModule_AddObject(module, "DenseLayer",
                            (PyObject *)&DenseLayerType) < 0) {
         Py_DECREF(&DenseLayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&LSTMLayerType);
+    if (PyModule_AddObject(module, "LSTMLayer",
+                           (PyObject *)&LSTMLayerType) < 0) {
+        Py_DECREF(&LSTMLayerType);
         Py_DECREF(module);
         return NULL;
     }

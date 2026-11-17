@@ -94,6 +94,25 @@ tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input);
 tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
                                     const tc_tensor_nd *target);
 
+/* Slice contiguo a lo largo de un eje (start + length <= shape[axis]). */
+tc_tensor_nd *tc_tensor_nd_slice_axis(const tc_tensor_nd *input, size_t axis,
+                                      size_t start, size_t length);
+/* Concatena N tensores en un eje; todas las demás dimensiones deben coincidir. */
+tc_tensor_nd *tc_tensor_nd_concat(const tc_tensor_nd *const *inputs,
+                                  size_t count, size_t axis);
+/* LayerNorm sobre la última dimensión (sin afín; componer con mul/add). */
+tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input);
+/* Transposición de matriz [M, N] -> [N, M]. */
+tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input);
+/*
+ * Atención single-head: softmax((Q Kᵀ)/sqrt(depth) + máscara) V sobre
+ * tensores [batch, seq, depth]. causal=1 enmascara posiciones futuras.
+ */
+tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
+                                     const tc_tensor_nd *key,
+                                     const tc_tensor_nd *value,
+                                     int causal);
+
 /* Runs reverse-mode autodiff from a scalar loss. Returns 1 on success. */
 int tc_tensor_nd_backward(tc_tensor_nd *loss);
 void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name);
@@ -146,6 +165,23 @@ tc_tensor_nd *tc_dense_layer_forward(tc_dense_layer *layer,
                                      const tc_tensor_nd *input);
 tc_tensor_nd *tc_dense_layer_weight(tc_dense_layer *layer);
 tc_tensor_nd *tc_dense_layer_bias(tc_dense_layer *layer);
+
+/*
+ * High-level LSTM layer over a full sequence. Input is [seq, batch, in]
+ * (time-major); output is [seq, batch, hidden]. h0/c0 start at zero and
+ * the same weights are shared across time steps (gradients accumulate).
+ * Building the forward unfolds the graph, so the output retains every
+ * step: release it only after backward/training use.
+ */
+typedef struct tc_lstm_layer tc_lstm_layer;
+tc_lstm_layer *tc_lstm_layer_create(size_t input_features, size_t hidden,
+                                    unsigned int seed);
+void tc_lstm_layer_free(tc_lstm_layer *layer);
+tc_tensor_nd *tc_lstm_layer_forward(tc_lstm_layer *layer,
+                                    const tc_tensor_nd *input);
+tc_tensor_nd *tc_lstm_layer_weight_ih(tc_lstm_layer *layer);
+tc_tensor_nd *tc_lstm_layer_weight_hh(tc_lstm_layer *layer);
+tc_tensor_nd *tc_lstm_layer_bias(tc_lstm_layer *layer);
 
 #ifdef __cplusplus
 }

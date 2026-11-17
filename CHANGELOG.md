@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0 — LSTM, atención y primitivas de secuencia
+
+- Nueva capa de alto nivel `tc_lstm_layer`: LSTM sobre una secuencia completa [seq, batch, in] (time-major) → [seq, batch, hidden], con pesos W_ih [4H, in], W_hh [4H, H] y sesgo [1, 4H] compartidos entre pasos (los gradientes se acumulan). El forward despliega el grafo paso a paso con slice/concat, así la salida retiene todo el historial para backward.
+- Nuevas operaciones de grafo: `tc_tensor_nd_slice_axis` (slice contiguo en un eje), `tc_tensor_nd_concat` (N tensores en un eje), `tc_tensor_nd_layer_norm` (sobre la última dimensión, sin afín), `tc_tensor_nd_transpose` (rango 2) y `tc_tensor_nd_attention` (single-head, softmax(QKᵀ/√d + máscara)V sobre [batch, seq, depth], con máscara causal opcional; recomputa P en backward sin retenerlo).
+- Refactor interno del grafo: los padres de cada nodo pasan de campos fijos `a`/`b` a un arreglo dinámico `parents` de tamaño arbitrario (necesario para concat de N y attention de 3 padres); la API pública existente no cambia.
+- Fix de fuga de memoria en el forward LSTM: las slices de las puertas se crean en variable local y se liberan tras crear su activación (la referencia de creación debe soltarse explícitamente); `leaks` reporta 0 bytes en toda la suite.
+- Validación: forward LSTM contra implementación de referencia independiente, gradientes por diferencias finitas y entrenamiento end-to-end (copy-task con Adam, la pérdida se reduce a menos de la mitad).
+- Bindings de Python: métodos `slice_axis`, `concat`, `layer_norm`, `transpose` y `attention` en `Tensor`, y nueva clase `LSTMLayer` (props `weight_ih`/`weight_hh`/`bias`, método `forward`).
+- Suite: 9/9 en Accelerate y 9/9 en el backend genérico, ASan limpio y 0 fugas en los 9 tests; MNIST al 100 % en ambos backends.
+
 ## 0.11.0 — sigmoid, tanh y capa densa
 
 - Nuevas operaciones de grafo `tc_tensor_nd_sigmoid` (rama estable según el signo, sin NaN/inf en entradas extremas) y `tc_tensor_nd_tanh`, ambas con gradiente analítico validado por diferencias finitas.

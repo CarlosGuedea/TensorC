@@ -222,6 +222,12 @@ x.sgd_step(0.01)
 
 capa = tensorc.Conv2DLayer(1, 8, 3, 3, stride=(1, 1), padding=(1, 1), seed=42)
 opt = tensorc.Adam([capa.kernel, capa.bias, w], 0.001)
+
+# Secuencias: LSTM time-major [seq, batch, in] y atención single-head.
+lstm = tensorc.LSTMLayer(in_features=8, hidden=16, seed=7)
+out = lstm.forward(tensorc.Tensor(datos))   # [seq, batch, 16]
+q = tensorc.Tensor(queries)                  # [batch, seq, depth]
+ctx = q.attention(tensorc.Tensor(keys), tensorc.Tensor(values), causal=True)
 ```
 
 Para publicar en PyPI: `python3 -m build` dentro de `python/` y
@@ -252,7 +258,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.9: softmax y cross-entropy en el grafo, optimizador Adam sobre listas de parámetros; la CNN de ejemplo llega a 93 % en MNIST.
 - 0.10: bindings oficiales de Python: extensión CPython escrita en C11 sobre el mismo núcleo, instalable con `pip install ./python` y publicable en PyPI.
 - 0.11: activaciones sigmoid y tanh en el grafo N-dim con autograd, capa densa de alto nivel (`tc_dense_layer` / `DenseLayer`) con inicialización Xavier determinista.
-- Siguientes pasos: guardado/carga de la CNN y GPU.
+- 0.12: LSTM de alto nivel sobre secuencias completas [seq, batch, in], atención single-head con máscara causal opcional, y primitivas de secuencia en el grafo (slice en eje, concat N-aria, layer norm y transposición); refactor interno a N padres por nodo y fix de fuga en el forward LSTM. Expuestos a Python: `LSTMLayer` y los métodos `slice_axis`, `concat`, `layer_norm`, `transpose` y `attention`.
+- Siguientes pasos: multi-head attention, guardado/carga de la CNN y GPU (Metal en macOS).
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

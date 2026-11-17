@@ -24,7 +24,12 @@ typedef enum {
     TC_ND_OP_SOFTMAX,
     TC_ND_OP_CROSS_ENTROPY,
     TC_ND_OP_SIGMOID,
-    TC_ND_OP_TANH
+    TC_ND_OP_TANH,
+    TC_ND_OP_SLICE,
+    TC_ND_OP_CONCAT,
+    TC_ND_OP_LAYERNORM,
+    TC_ND_OP_TRANSPOSE,
+    TC_ND_OP_ATTENTION
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -39,7 +44,12 @@ struct tc_tensor_nd {
     tc_nd_op op;
     tc_conv2d_options conv_options;
     size_t parent_count;
-    tc_tensor_nd *parents[2];
+    tc_tensor_nd **parents;
+    /* Parámetros de slice_axis: eje y desplazamiento de inicio. */
+    size_t slice_axis;
+    size_t slice_start;
+    /* Máscara causal de la atención (1 = no atender al futuro). */
+    int attn_causal;
 };
 
 static int checked_product(const size_t *shape, size_t ndim, size_t *result) {
@@ -114,6 +124,7 @@ void tc_tensor_nd_free(tc_tensor_nd *tensor) {
     if (--tensor->refcount != 0) return;
     for (size_t i = 0; i < tensor->parent_count; ++i)
         tc_tensor_nd_free(tensor->parents[i]);
+    free(tensor->parents);
     free(tensor->shape);
     free(tensor->strides);
     free(tensor->data);
@@ -176,18 +187,43 @@ int tc_tensor_nd_reshape(tc_tensor_nd *tensor, const size_t *shape,
 }
 
 static tc_tensor_nd *operation_result(const size_t *shape, size_t ndim,
-                                      tc_nd_op op, tc_tensor_nd *a,
-                                      tc_tensor_nd *b) {
-    const int requires_grad = (a && a->requires_grad) || (b && b->requires_grad);
+                                      tc_nd_op op, tc_tensor_nd **parents,
+                                      size_t parent_count) {
+    int requires_grad = 0;
+    for (size_t i = 0; i < parent_count; ++i)
+        requires_grad = requires_grad || parents[i]->requires_grad;
     tc_tensor_nd *result = tensor_alloc(shape, ndim, requires_grad, 1);
     if (!result) return NULL;
     result->op = op;
-    result->parent_count = b ? 2 : 1;
-    result->parents[0] = a;
-    result->parents[1] = b;
-    tc_tensor_nd_retain(a);
-    if (b) tc_tensor_nd_retain(b);
+    result->parent_count = parent_count;
+    if (parent_count > 0) {
+        result->parents = (tc_tensor_nd **)malloc(parent_count *
+                                                  sizeof(*parents));
+        if (!result->parents) {
+            tc_tensor_nd_free(result);
+            return NULL;
+        }
+        for (size_t i = 0; i < parent_count; ++i) {
+            result->parents[i] = parents[i];
+            tc_tensor_nd_retain(parents[i]);
+        }
+    }
     return result;
+}
+
+/* Versión de dos padres para las operaciones binarias existentes.
+ * Acepta punteros const porque solo necesitan retenerse (refcount). */
+static tc_tensor_nd *binary_result(const size_t *shape, size_t ndim,
+                                   tc_nd_op op, const tc_tensor_nd *a,
+                                   const tc_tensor_nd *b) {
+    tc_tensor_nd *parents[] = {(tc_tensor_nd *)a, (tc_tensor_nd *)b};
+    return operation_result(shape, ndim, op, parents, 2);
+}
+
+static tc_tensor_nd *unary_result(const size_t *shape, size_t ndim,
+                                  tc_nd_op op, const tc_tensor_nd *a) {
+    tc_tensor_nd *parent = (tc_tensor_nd *)a;
+    return operation_result(shape, ndim, op, &parent, 1);
 }
 
 static int same_shape(const tc_tensor_nd *a, const tc_tensor_nd *b) {
@@ -239,8 +275,8 @@ tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
     size_t *shape = NULL;
     size_t ndim = 0;
     if (!broadcast_shape(a, b, &shape, &ndim)) return NULL;
-    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_ADD,
-                                            (tc_tensor_nd *)a, (tc_tensor_nd *)b);
+    tc_tensor_nd *result = binary_result(shape, ndim, TC_ND_OP_ADD,
+                                            a, b);
     free(shape);
     if (!result) return NULL;
     for (size_t i = 0; i < result->size; ++i) {
@@ -255,8 +291,8 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
     size_t *shape = NULL;
     size_t ndim = 0;
     if (!broadcast_shape(a, b, &shape, &ndim)) return NULL;
-    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_MUL,
-                                            (tc_tensor_nd *)a, (tc_tensor_nd *)b);
+    tc_tensor_nd *result = binary_result(shape, ndim, TC_ND_OP_MUL,
+                                            a, b);
     free(shape);
     if (!result) return NULL;
     for (size_t i = 0; i < result->size; ++i) {
@@ -270,8 +306,8 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
 tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
     if (!a || !b || a->ndim != 2 || b->ndim != 2 || a->shape[1] != b->shape[0]) return NULL;
     const size_t shape[] = {a->shape[0], b->shape[1]};
-    tc_tensor_nd *result = operation_result(shape, 2, TC_ND_OP_MATMUL,
-                                            (tc_tensor_nd *)a, (tc_tensor_nd *)b);
+    tc_tensor_nd *result = binary_result(shape, 2, TC_ND_OP_MATMUL,
+                                            a, b);
     if (!result) return NULL;
     for (size_t i = 0; i < a->shape[0]; ++i)
         for (size_t k = 0; k < a->shape[1]; ++k)
@@ -438,9 +474,9 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
     const size_t output_shape[] = {
         input->shape[0], kernel->shape[0], output_height, output_width
     };
-    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_CONV2D,
-                                            (tc_tensor_nd *)input,
-                                            (tc_tensor_nd *)kernel);
+    tc_tensor_nd *result = binary_result(output_shape, 4, TC_ND_OP_CONV2D,
+                                            input,
+                                            kernel);
     if (!result) return NULL;
     result->conv_options = options;
 
@@ -454,8 +490,8 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
 
 tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     if (!input) return NULL;
-    tc_tensor_nd *result = operation_result(input->shape, input->ndim, TC_ND_OP_RELU,
-                                            (tc_tensor_nd *)input, NULL);
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim, TC_ND_OP_RELU,
+                                            input);
     if (!result) return NULL;
     for (size_t i = 0; i < input->size; ++i)
         result->data[i] = input->data[i] > 0.0f ? input->data[i] : 0.0f;
@@ -464,9 +500,9 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
 
 tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input) {
     if (!input) return NULL;
-    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                             TC_ND_OP_SIGMOID,
-                                            (tc_tensor_nd *)input, NULL);
+                                            input);
     if (!result) return NULL;
     for (size_t i = 0; i < input->size; ++i) {
         /* Rama estable según el signo: evita exp() de argumento positivo. */
@@ -480,9 +516,9 @@ tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input) {
 
 tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input) {
     if (!input) return NULL;
-    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                             TC_ND_OP_TANH,
-                                            (tc_tensor_nd *)input, NULL);
+                                            input);
     if (!result) return NULL;
     for (size_t i = 0; i < input->size; ++i)
         result->data[i] = tanhf(input->data[i]);
@@ -492,9 +528,9 @@ tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input) {
 tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input) {
     if (!input || input->ndim == 0 || input->shape[input->ndim - 1] == 0)
         return NULL;
-    tc_tensor_nd *result = operation_result(input->shape, input->ndim,
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                             TC_ND_OP_SOFTMAX,
-                                            (tc_tensor_nd *)input, NULL);
+                                            input);
     if (!result) return NULL;
     const size_t classes = input->shape[input->ndim - 1];
     const size_t rows = input->size / classes;
@@ -523,9 +559,9 @@ tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
     const size_t classes = prediction->shape[prediction->ndim - 1];
     const size_t rows = prediction->size / classes;
     const size_t shape[] = {1};
-    tc_tensor_nd *result = operation_result(shape, 1, TC_ND_OP_CROSS_ENTROPY,
-                                            (tc_tensor_nd *)prediction,
-                                            (tc_tensor_nd *)target);
+    tc_tensor_nd *result = binary_result(shape, 1, TC_ND_OP_CROSS_ENTROPY,
+                                            prediction,
+                                            target);
     if (!result) return NULL;
     for (size_t r = 0; r < rows; ++r)
         for (size_t j = 0; j < classes; ++j) {
@@ -542,8 +578,8 @@ tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
     size_t size = 0;
     if (!input || !checked_product(shape, ndim, &size) || size != input->size)
         return NULL;
-    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_RESHAPE,
-                                            (tc_tensor_nd *)input, NULL);
+    tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_RESHAPE,
+                                            input);
     if (!result) return NULL;
     memcpy(result->data, input->data, input->size * sizeof(float));
     return result;
@@ -558,8 +594,8 @@ tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
         input->shape[0], input->shape[1],
         input->shape[2] / pool_h, input->shape[3] / pool_w
     };
-    tc_tensor_nd *result = operation_result(output_shape, 4, TC_ND_OP_MAXPOOL2D,
-                                            (tc_tensor_nd *)input, NULL);
+    tc_tensor_nd *result = unary_result(output_shape, 4, TC_ND_OP_MAXPOOL2D,
+                                            input);
     if (!result) return NULL;
 
     const size_t batch = input->shape[0];
@@ -591,8 +627,8 @@ tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
 tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input) {
     if (!input) return NULL;
     const size_t shape[] = {1};
-    tc_tensor_nd *result = operation_result(shape, 1, TC_ND_OP_SUM,
-                                            (tc_tensor_nd *)input, NULL);
+    tc_tensor_nd *result = unary_result(shape, 1, TC_ND_OP_SUM,
+                                            input);
     if (!result) return NULL;
     for (size_t i = 0; i < input->size; ++i) result->data[0] += input->data[i];
     return result;
@@ -602,15 +638,217 @@ tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
                                     const tc_tensor_nd *target) {
     if (!same_shape(prediction, target)) return NULL;
     const size_t shape[] = {1};
-    tc_tensor_nd *result = operation_result(shape, 1, TC_ND_OP_MSE,
-                                            (tc_tensor_nd *)prediction,
-                                            (tc_tensor_nd *)target);
+    tc_tensor_nd *result = binary_result(shape, 1, TC_ND_OP_MSE,
+                                            prediction,
+                                            target);
     if (!result) return NULL;
     for (size_t i = 0; i < prediction->size; ++i) {
         const float error = prediction->data[i] - target->data[i];
         result->data[0] += error * error;
     }
     result->data[0] /= (float)prediction->size;
+    return result;
+}
+
+/*
+ * Slice contiguo a lo largo de un eje: la salida conserva el rango y copia
+ * shape[axis] = length. Requiere start + length <= input->shape[axis].
+ */
+tc_tensor_nd *tc_tensor_nd_slice_axis(const tc_tensor_nd *input, size_t axis,
+                                      size_t start, size_t length) {
+    if (!input || axis >= input->ndim || length == 0 ||
+        start > input->shape[axis] || length > input->shape[axis] - start)
+        return NULL;
+    size_t shape[8];
+    for (size_t i = 0; i < input->ndim; ++i)
+        shape[i] = i == axis ? length : input->shape[i];
+    tc_tensor_nd *result = unary_result(shape, input->ndim, TC_ND_OP_SLICE,
+                                        input);
+    if (!result) return NULL;
+    result->slice_axis = axis;
+    result->slice_start = start;
+    const size_t inner = input->strides[axis];
+    const size_t outer = input->size / (input->shape[axis] * inner);
+    const size_t block = length * inner;
+    for (size_t o = 0; o < outer; ++o) {
+        const size_t src_base = o * input->shape[axis] * inner + start * inner;
+        memcpy(result->data + o * block, input->data + src_base,
+               block * sizeof(float));
+    }
+    return result;
+}
+
+/*
+ * Concatena N tensores a lo largo de un eje. Todos deben tener el mismo
+ * rango y coincidir en todas las dimensiones excepto en `axis`.
+ */
+tc_tensor_nd *tc_tensor_nd_concat(const tc_tensor_nd *const *inputs,
+                                  size_t count, size_t axis) {
+    if (!inputs || count == 0 || !inputs[0] || axis >= inputs[0]->ndim)
+        return NULL;
+    /* Caso trivial: un solo tensor pasa derecho (reshape metadata). */
+    if (count == 1) {
+        tc_tensor_nd *result =
+            unary_result(inputs[0]->shape, inputs[0]->ndim, TC_ND_OP_RESHAPE,
+                         inputs[0]);
+        if (result) memcpy(result->data, inputs[0]->data,
+                           inputs[0]->size * sizeof(float));
+        return result;
+    }
+    const size_t ndim = inputs[0]->ndim;
+    for (size_t i = 1; i < count; ++i) {
+        if (!inputs[i] || inputs[i]->ndim != ndim) return NULL;
+        for (size_t d = 0; d < ndim; ++d)
+            if (d != axis && inputs[i]->shape[d] != inputs[0]->shape[d])
+                return NULL;
+    }
+    size_t shape[8], axis_total = 0;
+    for (size_t d = 0; d < ndim; ++d) shape[d] = inputs[0]->shape[d];
+    for (size_t i = 0; i < count; ++i) axis_total += inputs[i]->shape[axis];
+    shape[axis] = axis_total;
+
+    tc_tensor_nd **parents = (tc_tensor_nd **)malloc(count * sizeof(*parents));
+    if (!parents) return NULL;
+    for (size_t i = 0; i < count; ++i)
+        parents[i] = (tc_tensor_nd *)inputs[i];
+    tc_tensor_nd *result = operation_result(shape, ndim, TC_ND_OP_CONCAT,
+                                            parents, count);
+    free(parents);
+    if (!result) return NULL;
+
+    /* Copia bloque a bloque: cada tensor aporta su tramo del eje. */
+    const size_t inner = inputs[0]->strides[axis];
+    const size_t outer = inputs[0]->size / (inputs[0]->shape[axis] * inner);
+    size_t axis_offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t block = inputs[i]->shape[axis] * inner;
+        for (size_t o = 0; o < outer; ++o)
+            memcpy(result->data + o * axis_total * inner + axis_offset * inner,
+                   inputs[i]->data + o * block, block * sizeof(float));
+        axis_offset += inputs[i]->shape[axis];
+    }
+    return result;
+}
+
+/*
+ * Layer normalization sobre la última dimensión. La salida tiene la forma
+ * de la entrada; cada fila (tramo de la última dimensión) queda con media
+ * 0 y varianza 1 (sesgada). La transformación afín (gamma/beta) se compone
+ * con mul/add estándar.
+ */
+tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input) {
+    if (!input || input->ndim == 0 || input->shape[input->ndim - 1] == 0)
+        return NULL;
+    const size_t width = input->shape[input->ndim - 1];
+    const size_t rows = input->size / width;
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim,
+                                        TC_ND_OP_LAYERNORM, input);
+    if (!result) return NULL;
+    for (size_t r = 0; r < rows; ++r) {
+        const float *src = input->data + r * width;
+        float *dst = result->data + r * width;
+        float mean = 0.0f;
+        for (size_t j = 0; j < width; ++j) mean += src[j];
+        mean /= (float)width;
+        float variance = 0.0f;
+        for (size_t j = 0; j < width; ++j) {
+            const float d = src[j] - mean;
+            variance += d * d;
+            dst[j] = d;
+        }
+        const float inv_std = 1.0f / sqrtf(variance / (float)width + 1e-5f);
+        for (size_t j = 0; j < width; ++j) dst[j] *= inv_std;
+    }
+    return result;
+}
+
+/*
+ * Transposición de una matriz (rango 2): [M, N] -> [N, M]. Es la pieza
+ * que falta para proyectar en LSTM (x Wᵀ) y para Q Kᵀ en atención.
+ */
+tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input) {
+    if (!input || input->ndim != 2) return NULL;
+    const size_t shape[] = {input->shape[1], input->shape[0]};
+    tc_tensor_nd *result = unary_result(shape, 2, TC_ND_OP_TRANSPOSE, input);
+    if (!result) return NULL;
+    for (size_t i = 0; i < input->shape[0]; ++i)
+        for (size_t j = 0; j < input->shape[1]; ++j)
+            result->data[j * input->shape[0] + i] = input->data[i * input->shape[1] + j];
+    return result;
+}
+
+/*
+ * Atención de producto punto escalado (single-head) sobre tensores
+ * [batch, seq, depth]: softmax((Q Kᵀ) / sqrt(depth) + máscara) V.
+ * Con causal=1 pone -inf en la parte estrictamente superior, de modo que
+ * cada posición solo atiende a sí misma y a las anteriores. Las
+ * proyecciones Q/K/V son responsabilidad del caller (p. ej. capas densas).
+ */
+tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
+                                     const tc_tensor_nd *key,
+                                     const tc_tensor_nd *value,
+                                     int causal) {
+    if (!query || !key || !value || query->ndim != 3 || key->ndim != 3 ||
+        value->ndim != 3 || query->shape[0] != key->shape[0] ||
+        query->shape[0] != value->shape[0] ||
+        query->shape[2] != key->shape[2] ||
+        key->shape[1] != value->shape[1] ||
+        query->shape[1] == 0 || key->shape[1] == 0)
+        return NULL;
+    const size_t shape[] = {query->shape[0], query->shape[1], value->shape[2]};
+    tc_tensor_nd *parents[] = {(tc_tensor_nd *)query, (tc_tensor_nd *)key,
+                               (tc_tensor_nd *)value};
+    tc_tensor_nd *result = operation_result(shape, 3, TC_ND_OP_ATTENTION,
+                                            parents, 3);
+    if (!result) return NULL;
+    result->attn_causal = causal != 0;
+
+    const size_t batch = query->shape[0];
+    const size_t q_seq = query->shape[1];
+    const size_t k_seq = key->shape[1];
+    const size_t depth = query->shape[2];
+    const size_t v_depth = value->shape[2];
+    const float scale = 1.0f / sqrtf((float)depth);
+    float *scores = (float *)malloc(q_seq * k_seq * sizeof(float));
+    if (!scores) {
+        tc_tensor_nd_free(result);
+        return NULL;
+    }
+    for (size_t n = 0; n < batch; ++n) {
+        const float *q = query->data + n * q_seq * depth;
+        const float *k = key->data + n * k_seq * depth;
+        const float *v = value->data + n * k_seq * v_depth;
+        float *out = result->data + n * q_seq * v_depth;
+        for (size_t i = 0; i < q_seq; ++i) {
+            for (size_t j = 0; j < k_seq; ++j) {
+                float dot = 0.0f;
+                for (size_t d = 0; d < depth; ++d)
+                    dot += q[i * depth + d] * k[j * depth + d];
+                scores[i * k_seq + j] = dot * scale;
+            }
+            if (causal)
+                for (size_t j = i + 1; j < k_seq; ++j)
+                    scores[i * k_seq + j] = -INFINITY;
+            float max_score = scores[i * k_seq];
+            for (size_t j = 1; j < k_seq; ++j)
+                if (scores[i * k_seq + j] > max_score)
+                    max_score = scores[i * k_seq + j];
+            float sum = 0.0f;
+            for (size_t j = 0; j < k_seq; ++j) {
+                scores[i * k_seq + j] = expf(scores[i * k_seq + j] - max_score);
+                sum += scores[i * k_seq + j];
+            }
+            for (size_t j = 0; j < k_seq; ++j)
+                scores[i * k_seq + j] /= sum;
+            for (size_t d = 0; d < v_depth; ++d) {
+                float acc = 0.0f;
+                for (size_t j = 0; j < k_seq; ++j)
+                    acc += scores[i * k_seq + j] * v[j * v_depth + d];
+                out[i * v_depth + d] = acc;
+            }
+        }
+    }
+    free(scores);
     return result;
 }
 
@@ -750,8 +988,8 @@ static void add_grad(tc_tensor_nd *tensor, size_t index, float value) {
 
 static void backward_node(tc_tensor_nd *tensor) {
     if (!tensor || !tensor->requires_grad || !tensor->grad) return;
-    tc_tensor_nd *a = tensor->parents[0];
-    tc_tensor_nd *b = tensor->parents[1];
+    tc_tensor_nd *a = tensor->parent_count > 0 ? tensor->parents[0] : NULL;
+    tc_tensor_nd *b = tensor->parent_count > 1 ? tensor->parents[1] : NULL;
     switch (tensor->op) {
         case TC_ND_OP_ADD:
             for (size_t i = 0; i < tensor->size; ++i) {
@@ -929,6 +1167,177 @@ static void backward_node(tc_tensor_nd *tensor) {
                 add_grad(b, i, -value);
             }
             break;
+        case TC_ND_OP_SLICE: {
+            /* Gradiente inverso del slice: se suma en la región origen. */
+            const size_t inner = a->strides[tensor->slice_axis];
+            const size_t outer = a->size / (a->shape[tensor->slice_axis] * inner);
+            const size_t block = tensor->shape[tensor->slice_axis] * inner;
+            for (size_t o = 0; o < outer; ++o) {
+                const size_t dst_base =
+                    o * a->shape[tensor->slice_axis] * inner +
+                    tensor->slice_start * inner;
+                for (size_t j = 0; j < block; ++j)
+                    add_grad(a, dst_base + j, tensor->grad[o * block + j]);
+            }
+            break;
+        }
+        case TC_ND_OP_CONCAT: {
+            /* Cada padre recibe el tramo del eje que aportó. El eje es la
+             * dimensión donde la forma del padre difiere de la salida. */
+            size_t concat_axis = 0;
+            for (size_t d = 0; d < tensor->ndim; ++d)
+                if (tensor->shape[d] != a->shape[d]) concat_axis = d;
+            const size_t inner = a->strides[concat_axis];
+            const size_t outer = a->size / (a->shape[concat_axis] * inner);
+            const float *grad = tensor->grad;
+            size_t axis_offset = 0;
+            for (size_t p = 0; p < tensor->parent_count; ++p) {
+                tc_tensor_nd *parent = tensor->parents[p];
+                const size_t block = parent->shape[concat_axis] * inner;
+                for (size_t o = 0; o < outer; ++o)
+                    for (size_t j = 0; j < block; ++j)
+                        add_grad(parent, o * parent->shape[concat_axis] * inner + j,
+                                 grad[o * tensor->shape[concat_axis] * inner +
+                                      axis_offset * inner + j]);
+                axis_offset += parent->shape[concat_axis];
+            }
+            break;
+        }
+        case TC_ND_OP_LAYERNORM: {
+            /* dx = (dy - mean(dy) - xhat * mean(dy * xhat)) / sqrt(var + eps) */
+            const size_t width = a->shape[a->ndim - 1];
+            const size_t rows = a->size / width;
+            for (size_t r = 0; r < rows; ++r) {
+                const float *src = a->data + r * width;
+                const float *dy = tensor->grad + r * width;
+                float mean = 0.0f, variance = 0.0f;
+                for (size_t j = 0; j < width; ++j) mean += src[j];
+                mean /= (float)width;
+                for (size_t j = 0; j < width; ++j) {
+                    const float d = src[j] - mean;
+                    variance += d * d;
+                }
+                const float inv_std =
+                    1.0f / sqrtf(variance / (float)width + 1e-5f);
+                float mean_dy = 0.0f, mean_dy_xhat = 0.0f;
+                for (size_t j = 0; j < width; ++j) {
+                    mean_dy += dy[j];
+                    mean_dy_xhat += dy[j] * (src[j] - mean) * inv_std;
+                }
+                mean_dy /= (float)width;
+                mean_dy_xhat /= (float)width;
+                for (size_t j = 0; j < width; ++j) {
+                    const float xhat = (src[j] - mean) * inv_std;
+                    add_grad(a, r * width + j,
+                             inv_std * (dy[j] - mean_dy - xhat * mean_dy_xhat));
+                }
+            }
+            break;
+        }
+        case TC_ND_OP_TRANSPOSE:
+            for (size_t i = 0; i < a->shape[0]; ++i)
+                for (size_t j = 0; j < a->shape[1]; ++j)
+                    add_grad(a, i * a->shape[1] + j,
+                             tensor->grad[j * a->shape[0] + i]);
+            break;
+        case TC_ND_OP_ATTENTION: {
+            /* Recomputa scores/P por bloque y aplica la regla
+             * dV=PᵀdO, dS=P⊙(dP−rowsum(dP⊙P))·scale, dQ=dS·K, dK=dSᵀ·Q. */
+            tc_tensor_nd *q = tensor->parents[0];
+            tc_tensor_nd *k = tensor->parents[1];
+            tc_tensor_nd *v = tensor->parents[2];
+            const size_t batch = q->shape[0];
+            const size_t q_seq = q->shape[1];
+            const size_t k_seq = k->shape[1];
+            const size_t depth = q->shape[2];
+            const size_t v_depth = v->shape[2];
+            const float scale = 1.0f / sqrtf((float)depth);
+            const size_t score_count = q_seq * k_seq;
+            float *scores = (float *)malloc(score_count * sizeof(float));
+            float *dp = (float *)malloc(score_count * sizeof(float));
+            if (!scores || !dp) {
+                free(scores);
+                free(dp);
+                break;
+            }
+            for (size_t n = 0; n < batch; ++n) {
+                const float *qd = q->data + n * q_seq * depth;
+                const float *kd = k->data + n * k_seq * depth;
+                const float *vd = v->data + n * k_seq * v_depth;
+                const float *dout = tensor->grad + n * q_seq * v_depth;
+                float *dq = q->grad ? q->grad + n * q_seq * depth : NULL;
+                float *dk = k->grad ? k->grad + n * k_seq * depth : NULL;
+                float *dv = v->grad ? v->grad + n * k_seq * v_depth : NULL;
+
+                /* Rehacer softmax para recuperar P. */
+                for (size_t i = 0; i < q_seq; ++i) {
+                    for (size_t j = 0; j < k_seq; ++j) {
+                        float dot = 0.0f;
+                        for (size_t d = 0; d < depth; ++d)
+                            dot += qd[i * depth + d] * kd[j * depth + d];
+                        scores[i * k_seq + j] = dot * scale;
+                    }
+                    if (tensor->attn_causal)
+                        for (size_t j = i + 1; j < k_seq; ++j)
+                            scores[i * k_seq + j] = -INFINITY;
+                    float max_score = scores[i * k_seq];
+                    for (size_t j = 1; j < k_seq; ++j)
+                        if (scores[i * k_seq + j] > max_score)
+                            max_score = scores[i * k_seq + j];
+                    float sum = 0.0f;
+                    for (size_t j = 0; j < k_seq; ++j) {
+                        scores[i * k_seq + j] = expf(scores[i * k_seq + j] - max_score);
+                        sum += scores[i * k_seq + j];
+                    }
+                    for (size_t j = 0; j < k_seq; ++j)
+                        scores[i * k_seq + j] /= sum;
+                }
+
+                /* dP = dO Vᵀ y su promedio ponderado por fila. */
+                for (size_t i = 0; i < q_seq; ++i) {
+                    float row_dot = 0.0f;
+                    for (size_t j = 0; j < k_seq; ++j) {
+                        float acc = 0.0f;
+                        for (size_t d = 0; d < v_depth; ++d)
+                            acc += dout[i * v_depth + d] * vd[j * v_depth + d];
+                        dp[i * k_seq + j] = acc;
+                        row_dot += acc * scores[i * k_seq + j];
+                    }
+                    for (size_t j = 0; j < k_seq; ++j) {
+                        const float ds =
+                            scores[i * k_seq + j] * (dp[i * k_seq + j] - row_dot) * scale;
+                        dp[i * k_seq + j] = ds;
+                    }
+                }
+
+                /* dV = Pᵀ dO. */
+                for (size_t j = 0; j < k_seq; ++j)
+                    for (size_t d = 0; d < v_depth; ++d) {
+                        float acc = 0.0f;
+                        for (size_t i = 0; i < q_seq; ++i)
+                            acc += scores[i * k_seq + j] * dout[i * v_depth + d];
+                        if (dv) dv[j * v_depth + d] += acc;
+                    }
+                /* dQ = dS K, dK = dSᵀ Q. */
+                for (size_t i = 0; i < q_seq; ++i)
+                    for (size_t d = 0; d < depth; ++d) {
+                        float acc_q = 0.0f;
+                        for (size_t j = 0; j < k_seq; ++j)
+                            acc_q += dp[i * k_seq + j] * kd[j * depth + d];
+                        if (dq) dq[i * depth + d] += acc_q;
+                    }
+                for (size_t j = 0; j < k_seq; ++j)
+                    for (size_t d = 0; d < depth; ++d) {
+                        float acc_k = 0.0f;
+                        for (size_t i = 0; i < q_seq; ++i)
+                            acc_k += dp[i * k_seq + j] * qd[i * depth + d];
+                        if (dk) dk[j * depth + d] += acc_k;
+                    }
+            }
+            free(scores);
+            free(dp);
+            break;
+        }
         case TC_ND_OP_LEAF:
         default:
             break;
@@ -1175,4 +1584,211 @@ void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer) {
     free(optimizer->v);
     free(optimizer->params);
     free(optimizer);
+}
+
+struct tc_lstm_layer {
+    tc_tensor_nd *weight_ih; /* [4H, input] */
+    tc_tensor_nd *weight_hh; /* [4H, hidden] */
+    tc_tensor_nd *bias;      /* [1, 4H] */
+    size_t hidden;
+};
+
+tc_lstm_layer *tc_lstm_layer_create(size_t input_features, size_t hidden,
+                                    unsigned int seed) {
+    if (input_features == 0 || hidden == 0) return NULL;
+    tc_lstm_layer *layer = (tc_lstm_layer *)calloc(1, sizeof(*layer));
+    if (!layer) return NULL;
+    layer->hidden = hidden;
+    const size_t w_ih_shape[] = {4 * hidden, input_features};
+    const size_t w_hh_shape[] = {4 * hidden, hidden};
+    const size_t bias_shape[] = {1, 4 * hidden};
+    layer->weight_ih = tc_tensor_nd_create(w_ih_shape, 2, 1);
+    layer->weight_hh = tc_tensor_nd_create(w_hh_shape, 2, 1);
+    layer->bias = tc_tensor_nd_create(bias_shape, 2, 1);
+    if (!layer->weight_ih || !layer->weight_hh || !layer->bias) {
+        tc_lstm_layer_free(layer);
+        return NULL;
+    }
+
+    /* Xavier uniforme para ambas matrices; sesgo en cero (como las demás
+     * capas). Las puertas olvidadas se inicializan con sesgo positivo en
+     * frameworks como PyTorch; aquí se mantiene cero por simplicidad y
+     * determinismo. */
+    const float fan_in = (float)(input_features + hidden);
+    const float fan_out = (float)(2 * hidden);
+    const float limit = sqrtf(6.0f / (fan_in + fan_out));
+    unsigned int state = seed ? seed : 1u;
+    float *w_ih = tc_tensor_nd_data(layer->weight_ih);
+    for (size_t i = 0; i < tc_tensor_nd_numel(layer->weight_ih); ++i) {
+        const float unit = (float)layer_rng_next(&state) / 4294967296.0f;
+        w_ih[i] = (2.0f * unit - 1.0f) * limit;
+    }
+    float *w_hh = tc_tensor_nd_data(layer->weight_hh);
+    for (size_t i = 0; i < tc_tensor_nd_numel(layer->weight_hh); ++i) {
+        const float unit = (float)layer_rng_next(&state) / 4294967296.0f;
+        w_hh[i] = (2.0f * unit - 1.0f) * limit;
+    }
+    return layer;
+}
+
+void tc_lstm_layer_free(tc_lstm_layer *layer) {
+    if (!layer) return;
+    tc_tensor_nd_free(layer->weight_ih);
+    tc_tensor_nd_free(layer->weight_hh);
+    tc_tensor_nd_free(layer->bias);
+    free(layer);
+}
+
+/*
+ * Forward sobre una secuencia completa. La entrada es [seq, batch, input]
+ * (time-major, como en PyTorch sin batch_first) y la salida es
+ * [seq, batch, hidden]. El estado inicial h0/c0 es cero. La salida retiene
+ * todo el grafo desplegado; liberarla libera todos los pasos.
+ *
+ * Implementación: despliegue temporal en pasos de grafo que reutilizan los
+ * mismos tensores de pesos (los gradientes se acumulan con +=). Por paso:
+ *   gates = x W_ihᵀ + h W_hhᵀ + b  (una matmul por matriz)
+ *   i, f, o = sigmoid(gates[:, 0:H], [H:2H], [3H:4H]); g = tanh([2H:3H])
+ *   c = f⊙c + i⊙g;  h = o⊙tanh(c)
+ */
+tc_tensor_nd *tc_lstm_layer_forward(tc_lstm_layer *layer,
+                                    const tc_tensor_nd *input) {
+    if (!layer || !input || input->ndim != 3 ||
+        input->shape[2] != tc_tensor_nd_shape(layer->weight_ih)[1])
+        return NULL;
+    const size_t seq = input->shape[0];
+    const size_t batch = input->shape[1];
+    const size_t input_features = input->shape[2];
+    const size_t hidden = layer->hidden;
+
+    const size_t h_shape[] = {batch, hidden};
+    tc_tensor_nd *h = tc_tensor_nd_create(h_shape, 2, 1);
+    tc_tensor_nd *c = tc_tensor_nd_create(h_shape, 2, 1);
+    if (!h || !c) {
+        tc_tensor_nd_free(h);
+        tc_tensor_nd_free(c);
+        return NULL;
+    }
+
+    /* W_ih^T [input, 4H] y W_hh^T [hidden, 4H]: se materializan una vez
+     * por forward como ops de grafo (con su propio gradiente hacia W). */
+    tc_tensor_nd *w_ih_t = tc_tensor_nd_transpose(layer->weight_ih);
+    tc_tensor_nd *w_hh_t = tc_tensor_nd_transpose(layer->weight_hh);
+    if (!w_ih_t || !w_hh_t) {
+        tc_tensor_nd_free(w_ih_t);
+        tc_tensor_nd_free(w_hh_t);
+        tc_tensor_nd_free(h);
+        tc_tensor_nd_free(c);
+        return NULL;
+    }
+
+    tc_tensor_nd **outputs = (tc_tensor_nd **)malloc(seq * sizeof(*outputs));
+    if (!outputs) {
+        tc_tensor_nd_free(w_ih_t);
+        tc_tensor_nd_free(w_hh_t);
+        tc_tensor_nd_free(h);
+        tc_tensor_nd_free(c);
+        return NULL;
+    }
+
+    const size_t x2d_shape[] = {batch, input_features};
+    int ok = 1;
+    for (size_t t = 0; ok && t < seq; ++t) {
+        tc_tensor_nd *x_t = tc_tensor_nd_slice_axis(input, 0, t, 1);
+        tc_tensor_nd *x2d = x_t ? tc_tensor_nd_reshape_to(x_t, x2d_shape, 2)
+                                : NULL;
+        tc_tensor_nd_free(x_t);
+        tc_tensor_nd *gx = x2d ? tc_tensor_nd_matmul(x2d, w_ih_t) : NULL;
+        tc_tensor_nd_free(x2d);
+        tc_tensor_nd *gh = tc_tensor_nd_matmul(h, w_hh_t);
+        tc_tensor_nd *sum1 = gx && gh ? tc_tensor_nd_add(gx, gh) : NULL;
+        tc_tensor_nd_free(gx);
+        tc_tensor_nd_free(gh);
+        tc_tensor_nd *gates = sum1 ? tc_tensor_nd_add(sum1, layer->bias)
+                                   : NULL;
+        tc_tensor_nd_free(sum1);
+        if (!gates) { ok = 0; break; }
+
+        /* Cada slice se materializa en variable local y se libera tras
+         * crear su activación: la referencia de creación debe soltarse
+         * explícitamente o el nodo queda huérfano con refcount 1. */
+        tc_tensor_nd *s_i = tc_tensor_nd_slice_axis(gates, 1, 0, hidden);
+        tc_tensor_nd *s_f = tc_tensor_nd_slice_axis(gates, 1, hidden, hidden);
+        tc_tensor_nd *s_g = tc_tensor_nd_slice_axis(gates, 1, 2 * hidden,
+                                                    hidden);
+        tc_tensor_nd *s_o = tc_tensor_nd_slice_axis(gates, 1, 3 * hidden,
+                                                    hidden);
+        tc_tensor_nd *i_g = s_i ? tc_tensor_nd_sigmoid(s_i) : NULL;
+        tc_tensor_nd *f_g = s_f ? tc_tensor_nd_sigmoid(s_f) : NULL;
+        tc_tensor_nd *g_g = s_g ? tc_tensor_nd_tanh(s_g) : NULL;
+        tc_tensor_nd *o_g = s_o ? tc_tensor_nd_sigmoid(s_o) : NULL;
+        tc_tensor_nd_free(s_i);
+        tc_tensor_nd_free(s_f);
+        tc_tensor_nd_free(s_g);
+        tc_tensor_nd_free(s_o);
+        tc_tensor_nd_free(gates);
+        if (!i_g || !f_g || !g_g || !o_g) {
+            tc_tensor_nd_free(i_g);
+            tc_tensor_nd_free(f_g);
+            tc_tensor_nd_free(g_g);
+            tc_tensor_nd_free(o_g);
+            ok = 0;
+            break;
+        }
+
+        /* c = f⊙c_prev + i⊙g */
+        tc_tensor_nd *fc = tc_tensor_nd_mul(f_g, c);
+        tc_tensor_nd *ig = tc_tensor_nd_mul(i_g, g_g);
+        tc_tensor_nd_free(i_g);
+        tc_tensor_nd_free(f_g);
+        tc_tensor_nd_free(g_g);
+        tc_tensor_nd *c_new = fc && ig ? tc_tensor_nd_add(fc, ig) : NULL;
+        tc_tensor_nd_free(fc);
+        tc_tensor_nd_free(ig);
+        /* h = o⊙tanh(c) */
+        tc_tensor_nd *tanh_c = c_new ? tc_tensor_nd_tanh(c_new) : NULL;
+        tc_tensor_nd *h_new = o_g && tanh_c ? tc_tensor_nd_mul(o_g, tanh_c)
+                                            : NULL;
+        tc_tensor_nd_free(o_g);
+        tc_tensor_nd_free(tanh_c);
+        if (!c_new || !h_new) {
+            tc_tensor_nd_free(c_new);
+            tc_tensor_nd_free(h_new);
+            ok = 0;
+            break;
+        }
+        tc_tensor_nd_free(c);
+        c = c_new;
+        tc_tensor_nd_free(h);
+        h = h_new;
+        /* Vista [1, batch, hidden] de este paso para el concat final:
+         * concat en el eje 0 de seq piezas produce [seq, batch, hidden]. */
+        const size_t step_shape[] = {1, batch, hidden};
+        outputs[t] = tc_tensor_nd_reshape_to(h, step_shape, 3);
+        if (!outputs[t]) ok = 0;
+    }
+
+    tc_tensor_nd *result = NULL;
+    if (ok) result = tc_tensor_nd_concat(
+        (const tc_tensor_nd *const *)outputs, seq, 0);
+    for (size_t t = 0; t < seq; ++t)
+        if (outputs[t]) tc_tensor_nd_free(outputs[t]);
+    free(outputs);
+    tc_tensor_nd_free(w_ih_t);
+    tc_tensor_nd_free(w_hh_t);
+    tc_tensor_nd_free(h);
+    tc_tensor_nd_free(c);
+    return result;
+}
+
+tc_tensor_nd *tc_lstm_layer_weight_ih(tc_lstm_layer *layer) {
+    return layer ? layer->weight_ih : NULL;
+}
+
+tc_tensor_nd *tc_lstm_layer_weight_hh(tc_lstm_layer *layer) {
+    return layer ? layer->weight_hh : NULL;
+}
+
+tc_tensor_nd *tc_lstm_layer_bias(tc_lstm_layer *layer) {
+    return layer ? layer->bias : NULL;
 }

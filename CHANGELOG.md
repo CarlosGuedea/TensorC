@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0 — bloque Transformer: atención multi-cabeza y permute
+
+- Nueva operación de grafo `tc_tensor_nd_permute`: permutación general de ejes (`out[i] = in[axes[i]]` por dimensión), con gradiente por el mapeo inverso validado por diferencias finitas.
+- Nueva `tc_tensor_nd_multihead_attention`: atención multi-cabeza sobre [batch, seq, depth] componiendo permute + reshape + atención single-head + concat, así el autograd fluye sin nodos nuevos; soporta máscara causal. Validada contra referencia independiente y diferencias finitas.
+- Nueva codificación posicional `tc_tensor_nd_sinusoidal_positions(seq, depth)` (hoja constante, seno en pares y coseno en impares).
+- Nueva capa de alto nivel `tc_transformer_block`: bloque pre-norm (x + MHA(LN(x)) y x + FFN(ReLU)(LN(x))) sobre [batch, seq, model_dim], con 8 parámetros entrenables (W_q/W_k/W_v/W_o, W1/b1, W2/b2) en Xavier determinista; `tc_transformer_block_param[i]` expone la lista para Adam.
+- El bloque aprende end-to-end: en la prueba reduce la pérdida del objetivo "promedio de la secuencia" a menos de la mitad con Adam.
+- Bindings de Python: métodos `permute` y `multihead_attention` en `Tensor`, clase `TransformerBlock` (prop `params` para Adam) y función `sinusoidal_positions`.
+- Suite: 10/10 en Accelerate y 10/10 en el backend genérico, ASan limpio y 0 fugas en los 10 tests.
+
 ## 0.12.0 — LSTM, atención y primitivas de secuencia
 
 - Nueva capa de alto nivel `tc_lstm_layer`: LSTM sobre una secuencia completa [seq, batch, in] (time-major) → [seq, batch, hidden], con pesos W_ih [4H, in], W_hh [4H, H] y sesgo [1, 4H] compartidos entre pasos (los gradientes se acumulan). El forward despliega el grafo paso a paso con slice/concat, así la salida retiene todo el historial para backward.

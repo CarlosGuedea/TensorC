@@ -112,6 +112,20 @@ tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
                                      const tc_tensor_nd *key,
                                      const tc_tensor_nd *value,
                                      int causal);
+/* Permutación general de ejes: out[i] = in[axes[i]] por dimensión. */
+tc_tensor_nd *tc_tensor_nd_permute(const tc_tensor_nd *input,
+                                   const size_t *axes, size_t ndim);
+/*
+ * Atención multi-cabeza sobre [batch, seq, depth] con `heads` cabezas
+ * (depth debe ser divisible entre heads). Compone permute + reshape +
+ * atención single-head + concat, así el autograd fluye sin nodos nuevos.
+ */
+tc_tensor_nd *tc_tensor_nd_multihead_attention(const tc_tensor_nd *query,
+                                               const tc_tensor_nd *key,
+                                               const tc_tensor_nd *value,
+                                               size_t heads, int causal);
+/* Codificación posicional sinusoidal [seq, depth] (hoja constante). */
+tc_tensor_nd *tc_tensor_nd_sinusoidal_positions(size_t seq, size_t depth);
 
 /* Runs reverse-mode autodiff from a scalar loss. Returns 1 on success. */
 int tc_tensor_nd_backward(tc_tensor_nd *loss);
@@ -182,6 +196,25 @@ tc_tensor_nd *tc_lstm_layer_forward(tc_lstm_layer *layer,
 tc_tensor_nd *tc_lstm_layer_weight_ih(tc_lstm_layer *layer);
 tc_tensor_nd *tc_lstm_layer_weight_hh(tc_lstm_layer *layer);
 tc_tensor_nd *tc_lstm_layer_bias(tc_lstm_layer *layer);
+
+/*
+ * Bloque Transformer pre-norm: atención multi-cabeza con residuales y
+ * FFN (ReLU) sobre [batch, seq, model_dim] -> misma forma. Pesos:
+ * W_q/W_k/W_v/W_o [model_dim, model_dim], W1 [model_dim, ff_dim],
+ * b1 [1, ff_dim], W2 [ff_dim, model_dim], b2 [1, model_dim], Xavier
+ * determinista. Los gradientes se acumulan en los 8 parámetros.
+ */
+typedef struct tc_transformer_block tc_transformer_block;
+tc_transformer_block *tc_transformer_block_create(size_t model_dim,
+                                                  size_t ff_dim,
+                                                  size_t heads,
+                                                  unsigned int seed);
+void tc_transformer_block_free(tc_transformer_block *block);
+tc_tensor_nd *tc_transformer_block_forward(tc_transformer_block *block,
+                                           const tc_tensor_nd *input);
+size_t tc_transformer_block_param_count(const tc_transformer_block *block);
+tc_tensor_nd *tc_transformer_block_param(tc_transformer_block *block,
+                                         size_t index);
 
 #ifdef __cplusplus
 }

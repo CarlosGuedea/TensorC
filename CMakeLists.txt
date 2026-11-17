@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.12.0 LANGUAGES C)
+project(TensorC VERSION 0.13.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
@@ -84,6 +84,9 @@ if(BUILD_TESTING)
     add_executable(tensorc_test_recurrent tests/test_recurrent.c)
     target_link_libraries(tensorc_test_recurrent PRIVATE TensorC::tensorc)
     add_test(NAME tensorc_recurrent COMMAND tensorc_test_recurrent)
+    add_executable(tensorc_test_transformer tests/test_transformer.c)
+    target_link_libraries(tensorc_test_transformer PRIVATE TensorC::tensorc)
+    add_test(NAME tensorc_transformer COMMAND tensorc_test_transformer)
 endif()
 
 include(GNUInstallDirs)

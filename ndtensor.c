@@ -29,7 +29,8 @@ typedef enum {
     TC_ND_OP_CONCAT,
     TC_ND_OP_LAYERNORM,
     TC_ND_OP_TRANSPOSE,
-    TC_ND_OP_ATTENTION
+    TC_ND_OP_ATTENTION,
+    TC_ND_OP_PERMUTE
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -50,6 +51,9 @@ struct tc_tensor_nd {
     size_t slice_start;
     /* Máscara causal de la atención (1 = no atender al futuro). */
     int attn_causal;
+    /* Permutación de ejes para TC_ND_OP_PERMUTE (perm[i] = eje de la
+     * entrada que va a la posición i de la salida). */
+    size_t perm[8];
 };
 
 static int checked_product(const size_t *shape, size_t ndim, size_t *result) {
@@ -778,6 +782,40 @@ tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input) {
 }
 
 /*
+ * Permutación general de ejes: la salida satisface
+ * out[i0, i1, ...] = in[i_{axes[0]}, i_{axes[1]}, ...]. Los ejes deben ser
+ * una permutación completa de 0..ndim-1 y ndim == rango de la entrada.
+ */
+tc_tensor_nd *tc_tensor_nd_permute(const tc_tensor_nd *input,
+                                   const size_t *axes, size_t ndim) {
+    if (!input || !axes || ndim == 0 || ndim != input->ndim || ndim > 8)
+        return NULL;
+    int seen[8] = {0};
+    size_t shape[8];
+    for (size_t i = 0; i < ndim; ++i) {
+        if (axes[i] >= ndim || seen[axes[i]]) return NULL;
+        seen[axes[i]] = 1;
+        shape[i] = input->shape[axes[i]];
+    }
+    tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_PERMUTE, input);
+    if (!result) return NULL;
+    for (size_t i = 0; i < ndim; ++i) result->perm[i] = axes[i];
+    /* Recorrido lineal de la entrada: cada índice lineal se descompone en
+     * índices multidimensionales y se reensambla en la posición de salida
+     * usando la permutación. */
+    size_t in_idx[8];
+    for (size_t lin = 0; lin < input->size; ++lin) {
+        for (size_t d = 0; d < ndim; ++d)
+            in_idx[d] = (lin / input->strides[d]) % input->shape[d];
+        size_t out_lin = 0;
+        for (size_t k = 0; k < ndim; ++k)
+            out_lin += in_idx[axes[k]] * result->strides[k];
+        result->data[out_lin] = input->data[lin];
+    }
+    return result;
+}
+
+/*
  * Atención de producto punto escalado (single-head) sobre tensores
  * [batch, seq, depth]: softmax((Q Kᵀ) / sqrt(depth) + máscara) V.
  * Con causal=1 pone -inf en la parte estrictamente superior, de modo que
@@ -1240,6 +1278,21 @@ static void backward_node(tc_tensor_nd *tensor) {
                     add_grad(a, i * a->shape[1] + j,
                              tensor->grad[j * a->shape[0] + i]);
             break;
+        case TC_ND_OP_PERMUTE: {
+            /* El forward es una biyección: cada índice lineal de la
+             * entrada contribuye su gradiente desde la posición permutada
+             * de la salida (mismo mapeo que en el forward). */
+            size_t in_idx[8];
+            for (size_t lin = 0; lin < a->size; ++lin) {
+                for (size_t d = 0; d < a->ndim; ++d)
+                    in_idx[d] = (lin / a->strides[d]) % a->shape[d];
+                size_t out_lin = 0;
+                for (size_t k = 0; k < a->ndim; ++k)
+                    out_lin += in_idx[tensor->perm[k]] * tensor->strides[k];
+                add_grad(a, lin, tensor->grad[out_lin]);
+            }
+            break;
+        }
         case TC_ND_OP_ATTENTION: {
             /* Recomputa scores/P por bloque y aplica la regla
              * dV=PᵀdO, dS=P⊙(dP−rowsum(dP⊙P))·scale, dQ=dS·K, dK=dSᵀ·Q. */
@@ -1791,4 +1844,260 @@ tc_tensor_nd *tc_lstm_layer_weight_hh(tc_lstm_layer *layer) {
 
 tc_tensor_nd *tc_lstm_layer_bias(tc_lstm_layer *layer) {
     return layer ? layer->bias : NULL;
+}
+
+/* --- Atención multi-cabeza y bloque Transformer --- */
+
+/* [batch, seq, depth] -> [batch*heads, seq, depth/heads]. */
+static tc_tensor_nd *split_heads(const tc_tensor_nd *t, size_t heads) {
+    const size_t batch = t->shape[0];
+    const size_t seq = t->shape[1];
+    const size_t depth = t->shape[2];
+    const size_t head_depth = depth / heads;
+    const size_t s1[] = {batch, seq, heads, head_depth};
+    tc_tensor_nd *a = tc_tensor_nd_reshape_to(t, s1, 4);
+    if (!a) return NULL;
+    const size_t axes[] = {0, 2, 1, 3};
+    tc_tensor_nd *b = tc_tensor_nd_permute(a, axes, 4);
+    tc_tensor_nd_free(a);
+    if (!b) return NULL;
+    const size_t s2[] = {batch * heads, seq, head_depth};
+    tc_tensor_nd *c = tc_tensor_nd_reshape_to(b, s2, 3);
+    tc_tensor_nd_free(b);
+    return c;
+}
+
+/* [batch*heads, seq, depth/heads] -> [batch, seq, depth]. */
+static tc_tensor_nd *merge_heads(const tc_tensor_nd *t, size_t batch,
+                                 size_t seq, size_t depth, size_t heads) {
+    const size_t head_depth = depth / heads;
+    const size_t s1[] = {batch, heads, seq, head_depth};
+    tc_tensor_nd *a = tc_tensor_nd_reshape_to(t, s1, 4);
+    if (!a) return NULL;
+    const size_t axes[] = {0, 2, 1, 3};
+    tc_tensor_nd *b = tc_tensor_nd_permute(a, axes, 4);
+    tc_tensor_nd_free(a);
+    if (!b) return NULL;
+    const size_t s2[] = {batch, seq, depth};
+    tc_tensor_nd *c = tc_tensor_nd_reshape_to(b, s2, 3);
+    tc_tensor_nd_free(b);
+    return c;
+}
+
+tc_tensor_nd *tc_tensor_nd_multihead_attention(const tc_tensor_nd *query,
+                                               const tc_tensor_nd *key,
+                                               const tc_tensor_nd *value,
+                                               size_t heads, int causal) {
+    if (!query || !key || !value || heads == 0 ||
+        query->ndim != 3 || key->ndim != 3 || value->ndim != 3 ||
+        query->shape[0] != key->shape[0] ||
+        query->shape[0] != value->shape[0] ||
+        query->shape[1] != key->shape[1] ||
+        key->shape[1] != value->shape[1] ||
+        query->shape[2] != key->shape[2] ||
+        query->shape[2] % heads != 0 ||
+        value->shape[2] % heads != 0)
+        return NULL;
+    const size_t batch = query->shape[0];
+    const size_t seq = query->shape[1];
+    const size_t depth = query->shape[2];
+
+    tc_tensor_nd *qh = split_heads(query, heads);
+    tc_tensor_nd *kh = split_heads(key, heads);
+    tc_tensor_nd *vh = split_heads(value, heads);
+    if (!qh || !kh || !vh) {
+        tc_tensor_nd_free(qh);
+        tc_tensor_nd_free(kh);
+        tc_tensor_nd_free(vh);
+        return NULL;
+    }
+    tc_tensor_nd *attn = tc_tensor_nd_attention(qh, kh, vh, causal);
+    tc_tensor_nd_free(qh);
+    tc_tensor_nd_free(kh);
+    tc_tensor_nd_free(vh);
+    if (!attn) return NULL;
+    tc_tensor_nd *merged = merge_heads(attn, batch, seq, depth, heads);
+    tc_tensor_nd_free(attn);
+    return merged;
+}
+
+tc_tensor_nd *tc_tensor_nd_sinusoidal_positions(size_t seq, size_t depth) {
+    if (seq == 0 || depth == 0) return NULL;
+    const size_t shape[] = {seq, depth};
+    tc_tensor_nd *pe = tc_tensor_nd_create(shape, 2, 0);
+    if (!pe) return NULL;
+    float *data = tc_tensor_nd_data(pe);
+    for (size_t p = 0; p < seq; ++p)
+        for (size_t i = 0; i < depth; ++i) {
+            const double angle =
+                (double)p / pow(10000.0, (double)(2 * (i / 2)) / (double)depth);
+            data[p * depth + i] =
+                (float)(i % 2 == 0 ? sin(angle) : cos(angle));
+        }
+    return pe;
+}
+
+struct tc_transformer_block {
+    size_t model_dim;
+    size_t ff_dim;
+    size_t heads;
+    tc_tensor_nd *w_q;
+    tc_tensor_nd *w_k;
+    tc_tensor_nd *w_v;
+    tc_tensor_nd *w_o;
+    tc_tensor_nd *w1;
+    tc_tensor_nd *b1;
+    tc_tensor_nd *w2;
+    tc_tensor_nd *b2;
+};
+
+/* Inicializa `weight` con Xavier uniforme determinista a partir de `state`. */
+static void xavier_fill(tc_tensor_nd *weight, size_t fan_in, size_t fan_out,
+                        unsigned int *state) {
+    const float limit =
+        sqrtf(6.0f / ((float)fan_in + (float)fan_out));
+    float *data = tc_tensor_nd_data(weight);
+    const size_t count = tc_tensor_nd_numel(weight);
+    for (size_t i = 0; i < count; ++i) {
+        const float unit = (float)layer_rng_next(state) / 4294967296.0f;
+        data[i] = (2.0f * unit - 1.0f) * limit;
+    }
+}
+
+static tc_tensor_nd *transformer_new_weight(size_t rows, size_t cols,
+                                            unsigned int *state) {
+    const size_t shape[] = {rows, cols};
+    tc_tensor_nd *w = tc_tensor_nd_create(shape, 2, 1);
+    if (w) xavier_fill(w, rows, cols, state);
+    return w;
+}
+
+static tc_tensor_nd *transformer_new_bias(size_t cols) {
+    const size_t shape[] = {1, cols};
+    return tc_tensor_nd_create(shape, 2, 1); /* datos ya en cero */
+}
+
+tc_transformer_block *tc_transformer_block_create(size_t model_dim,
+                                                  size_t ff_dim,
+                                                  size_t heads,
+                                                  unsigned int seed) {
+    if (model_dim == 0 || ff_dim == 0 || heads == 0 ||
+        model_dim % heads != 0)
+        return NULL;
+    tc_transformer_block *block =
+        (tc_transformer_block *)calloc(1, sizeof(*block));
+    if (!block) return NULL;
+    block->model_dim = model_dim;
+    block->ff_dim = ff_dim;
+    block->heads = heads;
+    unsigned int state = seed ? seed : 1u;
+    block->w_q = transformer_new_weight(model_dim, model_dim, &state);
+    block->w_k = transformer_new_weight(model_dim, model_dim, &state);
+    block->w_v = transformer_new_weight(model_dim, model_dim, &state);
+    block->w_o = transformer_new_weight(model_dim, model_dim, &state);
+    block->w1 = transformer_new_weight(model_dim, ff_dim, &state);
+    block->b1 = transformer_new_bias(ff_dim);
+    block->w2 = transformer_new_weight(ff_dim, model_dim, &state);
+    block->b2 = transformer_new_bias(model_dim);
+    if (!block->w_q || !block->w_k || !block->w_v || !block->w_o ||
+        !block->w1 || !block->b1 || !block->w2 || !block->b2) {
+        tc_transformer_block_free(block);
+        return NULL;
+    }
+    return block;
+}
+
+void tc_transformer_block_free(tc_transformer_block *block) {
+    if (!block) return;
+    tc_tensor_nd_free(block->w_q);
+    tc_tensor_nd_free(block->w_k);
+    tc_tensor_nd_free(block->w_v);
+    tc_tensor_nd_free(block->w_o);
+    tc_tensor_nd_free(block->w1);
+    tc_tensor_nd_free(block->b1);
+    tc_tensor_nd_free(block->w2);
+    tc_tensor_nd_free(block->b2);
+    free(block);
+}
+
+size_t tc_transformer_block_param_count(const tc_transformer_block *block) {
+    (void)block;
+    return 8;
+}
+
+tc_tensor_nd *tc_transformer_block_param(tc_transformer_block *block,
+                                         size_t index) {
+    if (!block || index >= 8) return NULL;
+    tc_tensor_nd *params[] = {block->w_q, block->w_k, block->w_v, block->w_o,
+                              block->w1,  block->b1,  block->w2, block->b2};
+    return params[index];
+}
+
+/*
+ * Pre-norm: x + MHA(LN(x)) y x + FFN(LN(x)). Las proyecciones y la FFN se
+ * calculan en 2D [batch*seq, model_dim]; solo la atención vuelve a 3D.
+ * Todas las operaciones son nodos de grafo: el backward es el estándar.
+ */
+tc_tensor_nd *tc_transformer_block_forward(tc_transformer_block *block,
+                                           const tc_tensor_nd *input) {
+    if (!block || !input || input->ndim != 3 ||
+        input->shape[2] != block->model_dim)
+        return NULL;
+    const size_t batch = input->shape[0];
+    const size_t seq = input->shape[1];
+    const size_t dim = block->model_dim;
+    const size_t flat = batch * seq;
+    const size_t x2_shape[] = {flat, dim};
+    const size_t x3_shape[] = {batch, seq, dim};
+
+    tc_tensor_nd *x2 = tc_tensor_nd_reshape_to(input, x2_shape, 2);
+    if (!x2) return NULL;
+    tc_tensor_nd *ln1 = tc_tensor_nd_layer_norm(x2);
+    tc_tensor_nd *q2 = ln1 ? tc_tensor_nd_matmul(ln1, block->w_q) : NULL;
+    tc_tensor_nd *k2 = ln1 ? tc_tensor_nd_matmul(ln1, block->w_k) : NULL;
+    tc_tensor_nd *v2 = ln1 ? tc_tensor_nd_matmul(ln1, block->w_v) : NULL;
+    tc_tensor_nd_free(ln1);
+    tc_tensor_nd *q = q2 ? tc_tensor_nd_reshape_to(q2, x3_shape, 3) : NULL;
+    tc_tensor_nd *k = k2 ? tc_tensor_nd_reshape_to(k2, x3_shape, 3) : NULL;
+    tc_tensor_nd *v = v2 ? tc_tensor_nd_reshape_to(v2, x3_shape, 3) : NULL;
+    tc_tensor_nd_free(q2);
+    tc_tensor_nd_free(k2);
+    tc_tensor_nd_free(v2);
+    tc_tensor_nd *attn =
+        (q && k && v)
+            ? tc_tensor_nd_multihead_attention(q, k, v, block->heads, 0)
+            : NULL;
+    tc_tensor_nd_free(q);
+    tc_tensor_nd_free(k);
+    tc_tensor_nd_free(v);
+    tc_tensor_nd *attn2 =
+        attn ? tc_tensor_nd_reshape_to(attn, x2_shape, 2) : NULL;
+    tc_tensor_nd_free(attn);
+    tc_tensor_nd *proj =
+        attn2 ? tc_tensor_nd_matmul(attn2, block->w_o) : NULL;
+    tc_tensor_nd_free(attn2);
+    tc_tensor_nd *h1 = (x2 && proj) ? tc_tensor_nd_add(x2, proj) : NULL;
+    tc_tensor_nd_free(proj);
+
+    tc_tensor_nd *ln2 = h1 ? tc_tensor_nd_layer_norm(h1) : NULL;
+    tc_tensor_nd *ff1a = ln2 ? tc_tensor_nd_matmul(ln2, block->w1) : NULL;
+    tc_tensor_nd_free(ln2);
+    tc_tensor_nd *ff1 = (ff1a && block->b1)
+                            ? tc_tensor_nd_add(ff1a, block->b1) : NULL;
+    tc_tensor_nd_free(ff1a);
+    tc_tensor_nd *ff2 = ff1 ? tc_tensor_nd_relu(ff1) : NULL;
+    tc_tensor_nd_free(ff1);
+    tc_tensor_nd *ff3a = ff2 ? tc_tensor_nd_matmul(ff2, block->w2) : NULL;
+    tc_tensor_nd_free(ff2);
+    tc_tensor_nd *ff3 = (ff3a && block->b2)
+                            ? tc_tensor_nd_add(ff3a, block->b2) : NULL;
+    tc_tensor_nd_free(ff3a);
+    tc_tensor_nd *out2 = (h1 && ff3) ? tc_tensor_nd_add(h1, ff3) : NULL;
+    tc_tensor_nd_free(ff3);
+    tc_tensor_nd *out =
+        out2 ? tc_tensor_nd_reshape_to(out2, x3_shape, 3) : NULL;
+    tc_tensor_nd_free(out2);
+    tc_tensor_nd_free(h1);
+    tc_tensor_nd_free(x2);
+    return out;
 }

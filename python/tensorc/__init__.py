@@ -5,9 +5,25 @@ extension that wraps it. Tensors keep their parents alive automatically,
 so ``backward()`` can be called from any scalar loss.
 """
 
-from ._tensorc import Adam, Conv2DLayer, DenseLayer, LSTMLayer, Tensor
+from ._tensorc import (
+    Adam,
+    Conv2DLayer,
+    DenseLayer,
+    LSTMLayer,
+    Tensor,
+    TransformerBlock,
+    sinusoidal_positions,
+)
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
-__all__ = ["Tensor", "Conv2DLayer", "DenseLayer", "LSTMLayer", "Adam",
-           "__version__"]
+__all__ = [
+    "Tensor",
+    "Conv2DLayer",
+    "DenseLayer",
+    "LSTMLayer",
+    "TransformerBlock",
+    "Adam",
+    "sinusoidal_positions",
+    "__version__",
+]

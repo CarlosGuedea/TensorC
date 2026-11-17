@@ -426,6 +426,49 @@ static PyObject *tensor_attention(TensorObject *self, PyObject *args,
         tc_tensor_nd_attention(self->tensor, key, value, causal));
 }
 
+static PyObject *tensor_permute(TensorObject *self, PyObject *args) {
+    PyObject *axes_obj;
+    if (!PyArg_ParseTuple(args, "O", &axes_obj)) return NULL;
+    PyObject *seq = PySequence_Fast(axes_obj, "axes debe ser una secuencia");
+    if (!seq) return NULL;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    size_t axes[8];
+    if (n < 1 || n > 8) {
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError, "axes debe tener entre 1 y 8 ejes");
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < n; ++i) {
+        const long a = PyLong_AsLong(PySequence_Fast_GET_ITEM(seq, i));
+        if (a < 0 || PyErr_Occurred()) {
+            Py_DECREF(seq);
+            PyErr_SetString(PyExc_ValueError, "ejes inválidos en axes");
+            return NULL;
+        }
+        axes[i] = (size_t)a;
+    }
+    Py_DECREF(seq);
+    return (PyObject *)tensor_wrap(
+        tc_tensor_nd_permute(self->tensor, axes, (size_t)n));
+}
+
+static PyObject *tensor_multihead_attention(TensorObject *self, PyObject *args,
+                                            PyObject *kwargs) {
+    static char *names[] = {"key", "value", "heads", "causal", NULL};
+    PyObject *key_obj, *value_obj;
+    unsigned long heads;
+    int causal = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOk|p", names, &key_obj,
+                                     &value_obj, &heads, &causal))
+        return NULL;
+    tc_tensor_nd *key = as_tensor(key_obj);
+    if (!key) return NULL;
+    tc_tensor_nd *value = as_tensor(value_obj);
+    if (!value) return NULL;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_multihead_attention(
+        self->tensor, key, value, (size_t)heads, causal));
+}
+
 static PyMethodDef tensor_methods[] = {
     {"zeros", (PyCFunction)tensor_zeros, METH_VARARGS | METH_KEYWORDS | METH_CLASS,
      "Tensor.zeros(shape, requires_grad=False)"},
@@ -462,6 +505,11 @@ static PyMethodDef tensor_methods[] = {
     {"attention", (PyCFunction)tensor_attention,
      METH_VARARGS | METH_KEYWORDS,
      "attention(key, value, causal=False) sobre [batch, seq, depth]."},
+    {"permute", (PyCFunction)tensor_permute, METH_VARARGS,
+     "permute(axes): out[i] = in[axes[i]] por dimensión."},
+    {"multihead_attention", (PyCFunction)tensor_multihead_attention,
+     METH_VARARGS | METH_KEYWORDS,
+     "multihead_attention(key, value, heads, causal=False) sobre [batch, seq, depth]."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -573,7 +621,13 @@ static PyTypeObject LayerType = {
     .tp_doc = "Trainable 2D convolution layer.",
 };
 
+/* Definida más abajo; declaración anticipada para la tabla de métodos. */
+static PyObject *module_sinusoidal_positions(PyObject *self, PyObject *args);
+
 static PyMethodDef module_methods[] = {
+    {"sinusoidal_positions", (PyCFunction)module_sinusoidal_positions,
+     METH_VARARGS,
+     "sinusoidal_positions(seq, depth) -> codificación posicional [seq, depth]."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -743,6 +797,101 @@ static PyTypeObject LSTMLayerType = {
               "(time-major, h0/c0 en cero).",
 };
 
+/* --- Capa Transformer (bloque pre-norm) --- */
+typedef struct {
+    PyObject_HEAD
+    tc_transformer_block *block;
+} TransformerBlockObject;
+
+static PyTypeObject TransformerBlockType;
+
+static void transformer_block_dealloc(TransformerBlockObject *self) {
+    tc_transformer_block_free(self->block);
+    PyObject_Del(self);
+}
+
+/* forward(x): x es [batch, seq, model_dim]; devuelve la misma forma. */
+static PyObject *transformer_block_forward(TransformerBlockObject *self,
+                                           PyObject *args) {
+    PyObject *input_obj;
+    if (!PyArg_ParseTuple(args, "O", &input_obj)) return NULL;
+    tc_tensor_nd *input = as_tensor(input_obj);
+    if (!input) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_transformer_block_forward(self->block, input));
+}
+
+/* params: lista de los 8 tensores entrenables (para Adam). */
+static PyObject *transformer_block_params(TransformerBlockObject *self,
+                                          void *closure) {
+    (void)closure;
+    const size_t count = tc_transformer_block_param_count(self->block);
+    PyObject *list = PyList_New((Py_ssize_t)count);
+    if (!list) return NULL;
+    for (size_t i = 0; i < count; ++i) {
+        tc_tensor_nd_retain(tc_transformer_block_param(self->block, i));
+        PyList_SET_ITEM(list, (Py_ssize_t)i,
+                        (PyObject *)tensor_wrap(
+                            tc_transformer_block_param(self->block, i)));
+    }
+    return list;
+}
+
+static PyObject *transformer_block_new(PyTypeObject *type, PyObject *args,
+                                       PyObject *kwargs) {
+    static char *names[] = {"model_dim", "ff_dim", "heads", "seed", NULL};
+    unsigned long model_dim, ff_dim, heads, seed = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "kkk|k", names, &model_dim,
+                                     &ff_dim, &heads, &seed))
+        return NULL;
+    TransformerBlockObject *obj =
+        PyObject_New(TransformerBlockObject, &TransformerBlockType);
+    if (!obj) return NULL;
+    obj->block = tc_transformer_block_create(model_dim, ff_dim, heads,
+                                             (unsigned int)seed);
+    if (!obj->block) {
+        PyObject_Del(obj);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "no se pudo crear el bloque transformer "
+                        "(model_dim debe ser divisible entre heads)");
+        return NULL;
+    }
+    return (PyObject *)obj;
+}
+
+static PyMethodDef transformer_block_methods[] = {
+    {"forward", (PyCFunction)transformer_block_forward, METH_VARARGS,
+     "forward(x) con x [batch, seq, model_dim] -> misma forma"},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyGetSetDef transformer_block_getset[] = {
+    {"params", (getter)transformer_block_params, NULL,
+     "Lista de los 8 tensores entrenables (para Adam).", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyTypeObject TransformerBlockType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.TransformerBlock",
+    .tp_basicsize = sizeof(TransformerBlockObject),
+    .tp_dealloc = (destructor)transformer_block_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = transformer_block_methods,
+    .tp_getset = transformer_block_getset,
+    .tp_new = transformer_block_new,
+    .tp_doc = "Bloque Transformer pre-norm (MHA + residual + FFN + residual).",
+};
+
+/* Codificación posicional sinusoidal [seq, depth]. */
+static PyObject *module_sinusoidal_positions(PyObject *self, PyObject *args) {
+    (void)self;
+    unsigned long seq, depth;
+    if (!PyArg_ParseTuple(args, "kk", &seq, &depth)) return NULL;
+    return (PyObject *)tensor_wrap(
+        tc_tensor_nd_sinusoidal_positions((size_t)seq, (size_t)depth));
+}
+
 /* --- Optimizador Adam --- */
 typedef struct {
     PyObject_HEAD
@@ -835,6 +984,7 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyType_Ready(&LayerType) < 0) return NULL;
     if (PyType_Ready(&DenseLayerType) < 0) return NULL;
     if (PyType_Ready(&LSTMLayerType) < 0) return NULL;
+    if (PyType_Ready(&TransformerBlockType) < 0) return NULL;
     if (PyType_Ready(&OptimizerType) < 0) return NULL;
     PyObject *module = PyModule_Create(&tensorc_module);
     if (!module) return NULL;
@@ -861,6 +1011,13 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyModule_AddObject(module, "LSTMLayer",
                            (PyObject *)&LSTMLayerType) < 0) {
         Py_DECREF(&LSTMLayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&TransformerBlockType);
+    if (PyModule_AddObject(module, "TransformerBlock",
+                           (PyObject *)&TransformerBlockType) < 0) {
+        Py_DECREF(&TransformerBlockType);
         Py_DECREF(module);
         return NULL;
     }

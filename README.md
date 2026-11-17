@@ -228,6 +228,12 @@ lstm = tensorc.LSTMLayer(in_features=8, hidden=16, seed=7)
 out = lstm.forward(tensorc.Tensor(datos))   # [seq, batch, 16]
 q = tensorc.Tensor(queries)                  # [batch, seq, depth]
 ctx = q.attention(tensorc.Tensor(keys), tensorc.Tensor(values), causal=True)
+
+# Bloque Transformer pre-norm (MHA + residuales + FFN), entrenable.
+bloque = tensorc.TransformerBlock(model_dim=64, ff_dim=128, heads=4, seed=1)
+x = tensorc.Tensor(lote).add(tensorc.sinusoidal_positions(seq, 64))  # broadcast
+y = bloque.forward(x)                        # [batch, seq, 64]
+opt = tensorc.Adam(bloque.params, 0.001)     # los 8 parámetros del bloque
 ```
 
 Para publicar en PyPI: `python3 -m build` dentro de `python/` y
@@ -259,7 +265,8 @@ cc -O2 -std=c11 -Iinclude -I. minitf.c examples/xor_public_api.c -lm -o tensorc_
 - 0.10: bindings oficiales de Python: extensión CPython escrita en C11 sobre el mismo núcleo, instalable con `pip install ./python` y publicable en PyPI.
 - 0.11: activaciones sigmoid y tanh en el grafo N-dim con autograd, capa densa de alto nivel (`tc_dense_layer` / `DenseLayer`) con inicialización Xavier determinista.
 - 0.12: LSTM de alto nivel sobre secuencias completas [seq, batch, in], atención single-head con máscara causal opcional, y primitivas de secuencia en el grafo (slice en eje, concat N-aria, layer norm y transposición); refactor interno a N padres por nodo y fix de fuga en el forward LSTM. Expuestos a Python: `LSTMLayer` y los métodos `slice_axis`, `concat`, `layer_norm`, `transpose` y `attention`.
-- Siguientes pasos: multi-head attention, guardado/carga de la CNN y GPU (Metal en macOS).
+- 0.13: bloque Transformer completo: operación `permute` (permutación general de ejes con autograd), atención multi-cabeza, codificación posicional sinusoidal y capa `tc_transformer_block` / `TransformerBlock` pre-norm (MHA + residuales + FFN) entrenable end-to-end con Adam.
+- Siguientes pasos: pila de bloques + embeddings para un encoder completo, guardado/carga de la CNN y GPU (Metal en macOS / CUDA en Linux para comparativas de tiempos).
 
 Las contribuciones son bienvenidas. La API aún puede evolucionar antes de llegar a 1.0.
 

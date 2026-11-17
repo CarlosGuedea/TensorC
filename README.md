@@ -236,10 +236,14 @@ y = bloque.forward(x)                        # [batch, seq, 64]
 opt = tensorc.Adam(bloque.params, 0.001)     # los 8 parámetros del bloque
 ```
 
-Para publicar en PyPI: `python3 -m build` dentro de `python/` y
-`python3 -m twine upload dist/*`; para ruedas multiplataforma usa
-[cibuildwheel](https://cibuildwheel.readthedocs.io/). El núcleo C se
-vendoriza en `python/tensorc/core/` (actualízalo con `python/sync_core.sh`).
+Para publicar en PyPI: el flujo `.github/workflows/wheels.yml` construye
+y sube automáticamente las ruedas multiplataforma (macOS x86_64/arm64,
+Linux x86_64/aarch64, Windows, CPython 3.9–3.13) y el sdist al crear un
+tag `v*`; en local, `python3 -m build` dentro de `python/` y
+`python3 -m twine upload dist/*` también funcionan. Para ruedas
+multiplataforma en local usa [cibuildwheel](https://cibuildwheel.readthedocs.io/).
+El núcleo C se vendoriza en `python/tensorc/core/` (actualízalo con
+`python/sync_core.sh`).
 
 ## Usarlo desde otro proyecto CMake
 

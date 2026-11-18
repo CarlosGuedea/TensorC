@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define TENSORC_VERSION "0.13.1"
+#define TENSORC_VERSION "0.14.0"
 
 typedef MTTensor tc_tensor;
 typedef MTActivation tc_activation;

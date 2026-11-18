@@ -32,8 +32,8 @@ automáticamente; solo necesitas un compilador C11.
 - **Tensores N-dimensionales con autograd**: suma, multiplicación
   elemento a elemento con broadcasting, matmul 2D, ReLU, sigmoid, tanh,
   softmax, suma, reshape, slice en eje, concat N-aria, transposición 2D,
-  permutación general de ejes, layer norm (sobre la última dimensión) y
-  max pooling 2D, todas con gradientes analíticos.
+  permutación general de ejes, layer norm (sobre la última dimensión),
+  max pooling 2D y average pooling 2D, todas con gradientes analíticos.
 - **Pérdidas y optimizadores**: MSE, cross-entropy (gradiente
   `(p − t) / filas`), SGD por paso y Adam sobre listas de parámetros.
 - **Convolución 2D** con stride y padding configurables; formatos
@@ -46,6 +46,11 @@ automáticamente; solo necesitas un compilador C11.
 - **Atención**: single-head (`Tensor.attention`, con máscara causal
   opcional) y multi-cabeza (`Tensor.multihead_attention`), más
   codificación posicional sinusoidal (`sinusoidal_positions`).
+- **Entrenamiento de alto nivel**: `tensorc.Model` con `fit` (mini-batches
+  con shuffle), `evaluate`, `predict`, `save_weights` y `load_weights`.
+- **Serialización**: guardar/cargar tensores y checkpoints binarios de
+  parámetros (`tensorc.save`, `tensorc.load`, `Tensor.save`,
+  `Tensor.copy_`), con validación de formato y formas.
 
 Cada operación valida formas incompatibles y reporta el error como
 excepción de Python.
@@ -102,6 +107,39 @@ y = bloque.forward(x)                    # [batch, seq, 64]
 opt = tensorc.Adam(bloque.params, 0.001) # los 8 parámetros del bloque
 ```
 
+### Entrenamiento de alto nivel con Model
+
+```python
+import tensorc
+
+layer = tensorc.DenseLayer(in_features=784, out_features=10, seed=1)
+model = tensorc.Model(
+    forward=lambda x: layer.forward(x).softmax(),
+    params=[layer.weight, layer.bias],
+    loss="cross_entropy",          # o "mse" o callable(pred, target)
+    learning_rate=0.01,
+)
+history = model.fit(x_train, y_train, epochs=50, batch_size=32,
+                    shuffle=True)
+model.save_weights("modelo.tck")   # checkpoint binario
+model2.load_weights("modelo.tck")  # valida formas y copia los pesos
+```
+
+### Guardar y cargar tensores
+
+```python
+import tensorc
+
+tensorc.save([w, b], "checkpoint.tck")   # lista de tensores o uno solo
+t = tensorc.load("checkpoint.tck")     # lista de Tensors (o uno solo)
+t[0].save("uno.tcb")                   # tensor individual
+copia = tensorc.load("uno.tcb", requires_grad=True)
+```
+
+El repositorio incluye un ejemplo completo de LLM miniature a nivel
+carácter (GPT de bolsillo entrenado con el Quijote, atención causal
+incluida) en `examples/char_llm_demo.py`.
+
 ## Crear tensores
 
 ```python
@@ -118,18 +156,21 @@ se pasa.
 ## Correctitud y validación
 
 Los gradientes de todas las operaciones se validan por **diferencias
-finitas** en la suite de pruebas del núcleo C (10/10 pruebas en los
+finitas** en la suite de pruebas del núcleo C (11/11 pruebas en los
 backends Accelerate y genérico, sin fugas de memoria detectadas, ASan
 limpio), y los bindings se verifican contra referencias NumPy con los
 mismos datos y dimensiones.
 
 ## Rendimiento
 
-En macOS, las multiplicaciones de matrices grandes y la ruta im2col de
-convolución usan Apple Accelerate (BLAS); el backend genérico en C puro
-sirve para cualquier otra plataforma. Las mediciones de referencia del
-repositorio comparan contra implementaciones equivalentes en NumPy con
-los mismos datos y dimensiones (ver `benchmarks/` en GitHub).
+En macOS, matmul (forward y backward), la difusión por filas (sesgos) y
+la ruta im2col de convolución usan Apple Accelerate (BLAS); el backend
+genérico en C puro sirve para cualquier otra plataforma. Mediciones de
+referencia (mismos datos y dimensiones, mediana de varias corridas,
+Apple Silicon): inferencia MLP y Conv2D forward **más rápidas que
+NumPy** (~1.1× y ~1.4×); entrenamiento de un MLP a ~0.6× de NumPy en el
+toy benchmark y ~1.8× más rápido en el dataset real Pima (768 muestras).
+Ver `benchmarks/` en GitHub para los scripts reproducibles.
 
 ## Compilar desde el código fuente
 

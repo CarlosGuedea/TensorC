@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.0 — Model de alto nivel, serialización, avgpool y optimizaciones
+
+- Nueva `tensorc.Model`: envuelve un forward + lista de parámetros con `fit` (mini-batches con shuffle), `evaluate`, `predict`, `save_weights` y `load_weights`. Python puro sobre el núcleo C.
+- Nueva operación `avgpool2d` (avg pooling 2D no traslapado) con backward que reparte el gradiente entre la ventana; binding `Tensor.avgpool2d` y pruebas con valores conocidos, gradiente analítico y diferencias finitas.
+- Serialización N-D: `tc_tensor_nd_save/load` (tensor único) y `tc_save_checkpoint` / `tc_load_checkpoint` / `tc_free_checkpoint` (lista de parámetros en un archivo binario versionado, validación estricta de formato). En Python: `tensorc.save`, `tensorc.load`, `Tensor.save` y el primitivo `tc_tensor_nd_copy_` (`Tensor.copy_`, copia de datos con validación de forma).
+- Optimizaciones en el núcleo (motivadas por benchmarks reproducibles contra NumPy con mismos datos/dimensiones): matmul forward y backward vía GEMM de Accelerate (el entrenamiento de un MLP 784→128→10 pasó de 4156 ms a 46.6 ms) y ruta rápida para la difusión por filas `[rows,cols]` contra `[1,cols]` en add/mul (forward y backward).
+- Nuevos benchmarks reproducibles en `benchmarks/python_compare/`: comparación MLP/Conv2D vs NumPy; Pima Indians Diabetes (TensorC ~1.8× más rápido, accuracy equivalente); predicción diaria del año 2023 de la estación Colima 6040 (TensorC ~1.26× más rápido, MSE equivalente).
+- Nuevo ejemplo `examples/char_llm_demo.py`: LLM miniature a nivel carácter (GPT de bolsillo) entrenado con el Quijote — embeddings one-hot, posiciones sinusoidales, bloques pre-norm con atención causal, softmax + cross-entropy, Adam y muestreo con temperatura. Loss 3.36 → 1.78 en 2000 pasos (255 s).
+- Suite: 11/11 en Accelerate y 11/11 en el backend genérico, ASan limpio y 0 fugas.
+
 ## 0.13.1 — documentación del paquete
 
 - README del paquete Python (`python/README.md`) reescrito por completo: instalación con `pip install tensorc`, features (regresión, Conv2D, LSTM, atención, bloque Transformer), ejemplos de uso, creación de tensores, validación de gradientes, rendimiento, build desde fuente y proceso de release con cibuildwheel.

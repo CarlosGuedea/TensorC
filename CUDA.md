@@ -6,11 +6,14 @@ camino genérico ante cualquier fallo de infraestructura (sin GPU, sin
 memoria de device). La API pública no cambia: el mismo código y las mismas
 pruebas corren en CPU o GPU según cómo se compiló la biblioteca.
 
-Estado: **v2 validada en la máquina con GPU** (RTX A2000 Laptop GPU,
+Estado: **v3 validada en la máquina con GPU** (RTX A2000 Laptop GPU,
 sm_86, bajo WSL2): suite 11/11 normal y 11/11 con `TC_CUDA_MIN_ELEMS=0`,
 y benchmarks medidos contra la línea base CPU (ver "Resultados medidos"
-más abajo). La v2 añade atención, `layer_norm`, permute/transpose y
-reshape en GPU: el bloque Transformer completo vive en device.
+más abajo). La v2 añadió atención, `layer_norm`, permute/transpose y
+reshape; la v3 añade `cross_entropy`, SGD/Adam y `zero_grad` en device,
+un **pool de memoria de device** y **sincronía diferida** (los wrappers
+no llaman `cudaDeviceSynchronize`: todo se encola en el stream por
+defecto y el host solo sincroniza cuando lee datos).
 
 ## Qué corre en GPU
 
@@ -24,9 +27,12 @@ reshape en GPU: el bloque Transformer completo vive en device.
 | `attention` (single y multi-cabeza) | ✔ | ✔ | GEMM batidas cuBLAS + softmax causal propio |
 | `permute` / `transpose` | ✔ | ✔ | kernel propio (biyección por índices) |
 | `reshape` | ✔ | ✔ | copia device→device / acumulación |
+| `cross_entropy` | ✔ | ✔ | reducción a dos niveles (bloque + atómico) |
+| `sgd_step` / `optimizer_step` (Adam) | — | ✔ | kernel in-place; momentos m/v viven en device |
+| `zero_grad` | — | ✔ | memset en device (no baja ceros al host) |
 
-El resto (`conv2d`, pooling, `slice`, `concat`, `cross_entropy`,
-reducciones, pasos de optimizador) sigue en CPU en esta v2.
+El resto (`conv2d`, pooling, `slice`, `concat`, otras reducciones) sigue
+en CPU en esta v3.
 
 **Regla de residencia**: además del umbral de tamaño (16 384 elementos por
 defecto), una op va a GPU si su entrada ya reside en device — caer a CPU en
@@ -45,9 +51,20 @@ una copia (host o device) está al día en todo momento**.
   como obsoleta; las ops encadenadas leen directamente de device sin
   transferencias intermedias.
 - La bajada D2H ocurre perezosamente: accesores (`tc_tensor_nd_data`,
-  `const_data`, `grad`), rutas genéricas de ops sin kernel, serialización,
-  `sgd_step` y el paso de Adam sincronizan antes de leer/escribir en host.
+  `const_data`, `grad`), rutas genéricas de ops sin kernel y
+  serialización sincronizan antes de leer/escribir en host.
 - `tc_cuda_set_device(int)` elige el dispositivo (v1: uno por proceso).
+- **Sincronía diferida**: los wrappers NO llaman `cudaDeviceSynchronize`;
+  kernels, GEMMs, memsets y copias se encolan en el stream por defecto
+  (orden garantizado entre ops) y el host solo sincroniza en las copias
+  D2H. Los wrappers comprueban el error de lanzamiento; un fallo de
+  ejecución se detecta en el siguiente punto de sincronía y aborta con
+  diagnóstico (política de dispositivo irrecuperable, detección
+  diferida). Esto eliminó ~1 ms de overhead por op bajo WSL2.
+- **Pool de memoria de device**: `tc__cuda_alloc/free` reutilizan bloques
+  por tamaño exacto en vez de llamar al driver en cada tensor
+  (cudaMalloc/cudaFree sincronizan el dispositivo). Seguro porque todo va
+  al mismo stream; los bloques se liberan al cerrar el proceso.
 - Fallos de reserva o subida de memoria → la op cae a CPU. Un fallo de
   dispositivo a mitad de un backward (GPU muerta) aborta con diagnóstico:
   la alternativa sería devolver gradientes corruptos en silencio.
@@ -116,7 +133,7 @@ Regla del proyecto: nada se da por terminado sin la suite y sin medir.
    `python3 examples/char_llm_demo.py 2000` con el paquete compilado con
    `TENSORC_CUDA=1`. Reportar tiempos de CPU y GPU lado a lado.
 
-## Resultados medidos (2026-11-17)
+## Resultados medidos (2026-11-17/18)
 
 Máquina: NVIDIA RTX A2000 Laptop GPU (sm_86) bajo WSL2 Ubuntu, CUDA
 12.9.86 (toolkit vía micromamba), gcc 13.3.0. CPU de línea base: Xeon
@@ -126,39 +143,54 @@ sobreestimar los factores).
 - **Suite**: 11/11 en build normal y 11/11 con `TC_CUDA_MIN_ELEMS=0`
   (todas las rutas CUDA forzadas, validadas por diferencias finitas).
 - **matmul 512×512 vía API de grafo** (`nd_matmul_bench.c`, media con
-  warmup): CPU genérico 30.767 ms → GPU 0.914 ms, **~34×**, checksum
-  idéntico (0.335800). GPU limitada aquí por la sync por op, no por
-  cuBLAS puro.
+  warmup): CPU genérico 30.767 ms → GPU 0.914 ms en la v1 (sync por op),
+  **0.339 ms con la v3 (sincronía diferida), ~91×**, checksum idéntico
+  (0.335800). GPU limitada por la latencia de lanzamiento, no por cuBLAS
+  puro.
 - **LLM** (`examples/char_llm_demo.py`, dim 64, 2 bloques, 2 cabezas,
-  seq 64, batch 48): CPU 2047 ms/paso → **309 ms/paso con la v2**
-  (**~6.6×**); la loss converge igual (3.355→2.372 en 300 pasos GPU).
-  Desglose: la v1 (solo matmul/elementwise en GPU) daba 658 ms/paso
-  (~3.1×); llevar atención + `layer_norm` + permute + reshape a GPU más
-  que dobló esa ganancia al eliminar las idas y vueltas host↔device del
-  bloque. Lo que queda en CPU (cross-entropy, paso de Adam, embedding)
-  explica el resto por Amdahl.
+  seq 64, batch 48): CPU 2047 ms/paso → **153 ms/paso con la v3**
+  (**~13.4×**); la loss converge igual (3.355→2.372 en 300 pasos GPU).
+  Desglose por versión: v1 (matmul/elementwise) 658 ms; v2 (+atención,
+  layer_norm, permute, reshape) 309 ms; v3 (+cross_entropy, Adam,
+  zero_grad, pool de memoria y sincronía diferida) 153 ms.
+
+### Diagnóstico del tiempo restante (v3)
+
+Medido con micro-benchmarks sobre tensores ya residentes:
+
+- **~0.8-0.9 ms por op de puro lanzamiento**: una ReLU sobre 196 K
+  elementos (cómputo ~8 µs) tarda 0.84 ms de media encadenada; un matmul
+  [3072,64]×[64,64] (cómputo ~10 µs) 0.86 ms. El paso del LLM lanza
+  ~300 ops (incluye los memsets de `zero_grad` por nodo), así que el
+  tiempo restante es casi todo latencia de lanzamiento WSL2/WDDM, no
+  cómputo.
+- El lado host no cuesta nada: la misma cadena por el camino CPU con
+  tensores 4×4 (Python + binding + grafo) mide 0.001 ms/op.
+- En Linux nativo el lanzamiento cuesta ~10 µs: el mismo código debería
+  bajar el paso a un dígito de ms. La palanca definitiva bajo WSL2 es
+  **CUDA Graphs** (capturar el paso y relanzarlo como un solo grafo),
+  que exige buffers estáticos: cambio de arquitectura mayor.
 
 Los pasos 3 (compute-sanitizer) y los benchmarks restantes del paso 4
 (`benchmark_vs_numpy.py`, CNN MNIST) quedan pendientes; la suite 11/11 y
 las dos mediciones de arriba son las que respaldan el estado "validado".
 
-## Limitaciones conocidas de la v2
+## Limitaciones conocidas de la v3
 
-- Un solo dispositivo por proceso; sin streams asíncronos (cada op
-  sincroniza: semántica todo-o-nada, simple y segura). El bloque
-  Transformer lanza ~60 ops sincronizadas por paso: relajar a streams es
-  la siguiente palanca de rendimiento.
+- Un solo dispositivo por proceso; un solo stream (el por defecto).
+  Suficiente con la sincronía diferida, porque el cuello medido es la
+  latencia de lanzamiento WSL2 (~0.8 ms/op), no la falta de solape.
+- La siguiente palanca de rendimiento es **CUDA Graphs** (ver
+  "Diagnóstico del tiempo restante"): requiere que el paso opere sobre
+  buffers estáticos para poder capturarlo.
 - Softmax, `layer_norm` y el dS de atención usan un hilo por fila; si el
-  perfil lo pide, el siguiente paso es un bloque por fila con reducciones
-  en memoria compartida (o warp por fila para widths ≤ 1024).
-- La atención reserva dos scratch de `batch·q_seq·k_seq` floats por
-  llamada (P y dP en el backward); una variante estilo flash-attention
-  evitaría materializar scores — solo si el perfil lo justifica.
-- `conv2d` sigue en CPU: candidato posterior (cuDNN o im2col+cuBLAS,
-  espejando la ruta Accelerate), pero primero medir.
-- `cross_entropy` y los pasos de optimizador (SGD/Adam) siguen en CPU: en
-  el LLM ya son lo dominante del tiempo restante; portarlos es mecánico
-  si se quiere exprimir más.
+  perfil lo pide (filas anchas), el siguiente paso es un bloque por fila
+  con reducciones en memoria compartida.
+- La atención materializa scores (scratch P y dP de `batch·q_seq·k_seq`
+  floats por llamada, salen del pool); una variante estilo
+  flash-attention lo evitaría — solo si el perfil lo justifica.
+- `conv2d`, pooling, `slice` y `concat` siguen en CPU (no están en el
+  camino caliente del LLM; portarlos es mecánico si un perfil lo pide).
 - Las transferencias D2H perezosas convierten ops encadenadas en casi
   libres, pero una alternancia GPU→CPU→GPU por ops sin kernel paga dos
   copias; la regla de residencia minimiza estos cruces.

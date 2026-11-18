@@ -63,9 +63,13 @@ size_t tc__cuda_min_elems(void);
 size_t tc__cuda_min_gemm_work(void);
 
 /* Memoria de dispositivo. Las copias devuelven 1 en éxito y 0 en fallo;
- * el llamador (ndtensor.c) decide si cae al camino de CPU. */
+ * el llamador (ndtensor.c) decide si cae al camino de CPU. La memoria va
+ * a un pool por tamaño exacto: los bloques liberados se reutilizan sin
+ * llamar al driver (cudaMalloc/cudaFree sincronizan el dispositivo), y la
+ * reutilización es segura porque todo el trabajo va al mismo stream
+ * (las escrituras nuevas se encolan tras las lecturas viejas). */
 float *tc__cuda_alloc(size_t count);
-void tc__cuda_free(float *ptr);
+void tc__cuda_free(float *ptr, size_t count);
 int tc__cuda_copy_h2d(float *dst_dev, const float *src_host, size_t count);
 int tc__cuda_copy_d2h(float *dst_host, const float *src_dev, size_t count);
 
@@ -167,6 +171,30 @@ int tc__cuda_permute_backward(const float *g, float *gx, size_t n,
  * gx[i] += g[i] (backward de reshape). */
 int tc__cuda_copy_d2d(float *dst_dev, const float *src_dev, size_t count);
 int tc__cuda_accumulate(float *dst, const float *src, size_t n);
+
+/* Pone a cero un buffer de device (zero_grad sin bajar a host). */
+int tc__cuda_zero_fill(float *dst, size_t n);
+
+/*
+ * Cross-entropy con softmax ya aplicada: loss = −Σ t·log(p) / rows.
+ * El forward es una reducción (dos niveles: bloque + atomicAdd escalar);
+ * el backward acumula sobre gp/gt (NULL = no se pide). p y t son [rows,
+ * classes] aplanados (n = rows·classes).
+ */
+int tc__cuda_cross_entropy_forward(const float *p, const float *t,
+                                   float *out, size_t n, size_t rows);
+int tc__cuda_cross_entropy_backward(const float *p, const float *t,
+                                    const float *g, float *gp, float *gt,
+                                    size_t n, size_t rows, int want_p,
+                                    int want_t);
+
+/* Pasos de optimizador en device (in-place sobre param; Adam además
+ * actualiza sus momentos m/v en device). bias1/bias2 son las correcciones
+ * 1−beta^t ya calculadas en host. */
+int tc__cuda_sgd_step(float *param, const float *grad, size_t n, float lr);
+int tc__cuda_adam_step(float *param, const float *grad, float *m, float *v,
+                       size_t n, float lr, float beta1, float beta2,
+                       float bias1, float bias2, float epsilon);
 
 #ifdef __cplusplus
 }

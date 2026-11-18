@@ -9,11 +9,12 @@
  * perezosas host↔device viven en ndtensor.c.
  *
  * Estilo C (el proyecto es C11); se compila con nvcc al configurar CMake
- * con -DTENSORC_USE_CUDA=ON. Cada wrapper público termina en
- * cudaDeviceSynchronize + comprobación de error: semántica síncrona y
- * todo-o-nada por llamada, así ndtensor.c puede marcar sus flags de
- * validez con seguridad. Es la v1 medible; la relajación a streams
- * asíncronos es un paso posterior, igual que la residencia prolongada.
+ * con -DTENSORC_USE_CUDA=ON. Los wrappers comprueban el error de
+ * lanzamiento pero NO sincronizan el dispositivo: todo se encola en el
+ * stream por defecto (orden garantizado entre ops) y la sincronía ocurre
+ * solo cuando el host necesita datos (copias D2H). La memoria de device
+ * sale de un pool por tamaño exacto para evitar los cudaMalloc/cudaFree
+ * sincronizantes en el bucle de entrenamiento.
  */
 #include "tensorc_cuda_internal.h"
 
@@ -35,10 +36,34 @@ static int tc__cuda_current_device = 0;
 static cublasHandle_t tc__cublas_handle = NULL;
 static size_t tc__min_elems = (size_t)16384;
 
+/* Pool de bloques de device: un entrenamiento repite las mismas formas
+ * cada paso, así que los bloques liberados se reutilizan por tamaño exacto
+ * en vez de volver al driver (cudaMalloc/cudaFree sincronizan el
+ * dispositivo; con cientos de allocs por paso serían el cuello de
+ * botella). La reutilización inmediata es segura porque todo el trabajo
+ * va al stream por defecto: lo nuevo se encola tras lo viejo. Los bloques
+ * se liberan de verdad al cerrar el proceso. */
+typedef struct tc__cuda_block {
+    float *ptr;
+    size_t count;
+    struct tc__cuda_block *next;
+} tc__cuda_block;
+
+static tc__cuda_block *tc__cuda_pool = NULL;
+
 static void tc__cuda_shutdown(void) {
     if (tc__cublas_handle) {
         cublasDestroy(tc__cublas_handle);
         tc__cublas_handle = NULL;
+    }
+    while (tc__cuda_pool) {
+        tc__cuda_block *block = tc__cuda_pool;
+        tc__cuda_pool = block->next;
+        if (tc__cuda_state > 0) {
+            cudaSetDevice(tc__cuda_current_device);
+            cudaFree(block->ptr);
+        }
+        free(block);
     }
 }
 
@@ -96,6 +121,19 @@ size_t tc__cuda_min_gemm_work(void) {
 float *tc__cuda_alloc(size_t count) {
     if (!tc__cuda_probe() || count == 0) return NULL;
     cudaSetDevice(tc__cuda_current_device);
+    /* Reutiliza un bloque libre del tamaño exacto (búsqueda lineal: la
+     * lista tiene una entrada por tamaño vivo, es corta). */
+    tc__cuda_block **link = &tc__cuda_pool;
+    while (*link) {
+        if ((*link)->count == count) {
+            tc__cuda_block *block = *link;
+            *link = block->next;
+            float *ptr = block->ptr;
+            free(block);
+            return ptr;
+        }
+        link = &(*link)->next;
+    }
     void *ptr = NULL;
     if (cudaMalloc(&ptr, count * sizeof(float)) != cudaSuccess) {
         cudaGetLastError();
@@ -104,11 +142,20 @@ float *tc__cuda_alloc(size_t count) {
     return (float *)ptr;
 }
 
-void tc__cuda_free(float *ptr) {
+void tc__cuda_free(float *ptr, size_t count) {
     if (!ptr || tc__cuda_state <= 0) return;
-    cudaSetDevice(tc__cuda_current_device);
-    cudaFree(ptr);
-    cudaGetLastError(); /* liberar nunca tumba el camino de CPU */
+    /* No toca el dispositivo: el bloque vuelve al pool para reutilizarse. */
+    tc__cuda_block *block = (tc__cuda_block *)malloc(sizeof(*block));
+    if (!block) {
+        cudaSetDevice(tc__cuda_current_device);
+        cudaFree(ptr);
+        cudaGetLastError();
+        return;
+    }
+    block->ptr = ptr;
+    block->count = count;
+    block->next = tc__cuda_pool;
+    tc__cuda_pool = block;
 }
 
 int tc__cuda_copy_h2d(float *dst_dev, const float *src_host, size_t count) {
@@ -137,10 +184,16 @@ static unsigned int tc__grid_for(size_t n) {
     return (unsigned int)((n + TC_CUDA_THREADS - 1) / TC_CUDA_THREADS);
 }
 
-/* Comprueba el lanzamiento y sincroniza: da semántica todo-o-nada. */
+/* Comprueba errores de lanzamiento (configuración, cuBLAS). NO sincroniza
+ * el dispositivo: kernels y GEMMs se encolan en el stream por defecto, que
+ * ya garantiza el orden entre ops, y sincronizar cada op cuesta ~1 ms por
+ * llamada bajo WSL2 (medido: ~300 ops/paso ≈ 300 ms de puro overhead en el
+ * LLM). La sincronía real ocurre donde el host necesita datos (copias
+ * D2H). Un fallo de ejecución se detecta en el siguiente punto de
+ * sincronía y sigue la política de dispositivo irrecuperable (abort con
+ * diagnóstico), igual que antes pero con detección diferida. */
 static int tc__cuda_commit(const char *what) {
     cudaError_t err = cudaGetLastError();
-    if (err == cudaSuccess) err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         fprintf(stderr, "TensorC CUDA: %s falló: %s\n", what,
                 cudaGetErrorString(err));
@@ -672,7 +725,7 @@ int tc__cuda_attention_forward(const float *q, const float *k,
             0.0f, out, (int)v_depth, (long long)(q_seq * v_depth),
             (int)batch);
     }
-    tc__cuda_free(scores);
+    tc__cuda_free(scores, batch * score_count);
     return ok && tc__cuda_commit("attention_forward");
 }
 
@@ -700,8 +753,8 @@ int tc__cuda_attention_backward(const float *q, const float *k,
     float *p = tc__cuda_alloc(batch * score_count);
     float *dp = tc__cuda_alloc(batch * score_count);
     if (!p || !dp) {
-        tc__cuda_free(p);
-        tc__cuda_free(dp);
+        tc__cuda_free(p, batch * score_count);
+        tc__cuda_free(dp, batch * score_count);
         return 0;
     }
     const float scale = 1.0f / sqrtf((float)depth);
@@ -728,8 +781,8 @@ int tc__cuda_attention_backward(const float *q, const float *k,
             p, dp, rows, k_seq, scale);
     if (!ok || !tc__cuda_commit("attention_backward prep")) {
         /* Nada se acumuló todavía: el llamador puede caer a CPU. */
-        tc__cuda_free(p);
-        tc__cuda_free(dp);
+        tc__cuda_free(p, batch * score_count);
+        tc__cuda_free(dp, batch * score_count);
         return 0;
     }
     /* Acumulaciones: dV += Pᵀ·dO, dQ += dS·K, dK += dSᵀ·Q (beta=1). Un
@@ -758,8 +811,8 @@ int tc__cuda_attention_backward(const float *q, const float *k,
                   1.0f, dk, (int)depth, (long long)(k_seq * depth),
                   (int)batch))
         tc__attention_fatal("dK");
-    tc__cuda_free(p);
-    tc__cuda_free(dp);
+    tc__cuda_free(p, batch * score_count);
+    tc__cuda_free(dp, batch * score_count);
     return tc__cuda_commit("attention_backward");
 }
 
@@ -860,4 +913,124 @@ int tc__cuda_layer_norm_backward(const float *x, const float *g, float *gx,
     tc__layer_norm_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, g, gx, rows, width);
     return tc__cuda_commit("layer_norm_backward");
+}
+
+/* ------------------------------------------------------------------ */
+/* Cross-entropy, optimizadores y utilidades de buffers.               */
+/* ------------------------------------------------------------------ */
+
+/* Reducción a dos niveles: cada bloque suma en memoria compartida y un
+ * hilo por bloque acumula al escalar de salida con atomicAdd (el orden no
+ * es determinista; la diferencia es del orden del redondeo y las
+ * tolerancias de la suite la absorben). La división entre `rows` va
+ * plegada por elemento. El wrapper pone `out` a cero antes de lanzar. */
+__global__ static void tc__ce_fwd_kernel(const float *p, const float *t,
+                                         float *out, size_t n,
+                                         size_t rows) {
+    __shared__ float block_sum[TC_CUDA_THREADS];
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    float value = 0.0f;
+    if (i < n) {
+        const float pi = p[i] > 1e-7f ? p[i] : 1e-7f;
+        value = -t[i] * logf(pi) / (float)rows;
+    }
+    block_sum[threadIdx.x] = value;
+    __syncthreads();
+    for (unsigned int s = TC_CUDA_THREADS / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) block_sum[threadIdx.x] += block_sum[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out, block_sum[0]);
+}
+
+/* dP = −t·(g/rows)/p y dT = −log(p)·(g/rows), acumulando; g es el gradiente
+ * escalar de la loss que vive en device. */
+__global__ static void tc__ce_bwd_kernel(const float *p, const float *t,
+                                         const float *g, float *gp,
+                                         float *gt, size_t n, size_t rows,
+                                         int want_p, int want_t) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float scale = g[0] / (float)rows;
+    const float pi = p[i] > 1e-7f ? p[i] : 1e-7f;
+    if (want_p) gp[i] += -t[i] * scale / pi;
+    if (want_t) gt[i] += -logf(pi) * scale;
+}
+
+__global__ static void tc__sgd_step_kernel(float *param, const float *grad,
+                                           size_t n, float lr) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    param[i] -= lr * grad[i];
+}
+
+/* Mismo orden de operaciones que el camino de CPU del optimizador. */
+__global__ static void tc__adam_step_kernel(float *param, const float *grad,
+                                            float *m, float *v, size_t n,
+                                            float lr, float beta1,
+                                            float beta2, float bias1,
+                                            float bias2, float epsilon) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = grad[i];
+    const float mj = beta1 * m[i] + (1.0f - beta1) * g;
+    const float vj = beta2 * v[i] + (1.0f - beta2) * g * g;
+    m[i] = mj;
+    v[i] = vj;
+    const float m_hat = mj / bias1;
+    const float v_hat = vj / bias2;
+    param[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
+}
+
+int tc__cuda_cross_entropy_forward(const float *p, const float *t,
+                                   float *out, size_t n, size_t rows) {
+    if (!p || !t || !out || rows == 0 || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    if (cudaMemset(out, 0, sizeof(float)) != cudaSuccess) return 0;
+    tc__ce_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(p, t, out, n,
+                                                            rows);
+    return tc__cuda_commit("cross_entropy_forward");
+}
+
+int tc__cuda_cross_entropy_backward(const float *p, const float *t,
+                                    const float *g, float *gp, float *gt,
+                                    size_t n, size_t rows, int want_p,
+                                    int want_t) {
+    if (!p || !t || !g || rows == 0 || tc__cuda_state <= 0) return 0;
+    if (want_p && !gp) return 0;
+    if (want_t && !gt) return 0;
+    if (!want_p && !want_t) return 1;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__ce_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
+        p, t, g, gp, gt, n, rows, want_p, want_t);
+    return tc__cuda_commit("cross_entropy_backward");
+}
+
+int tc__cuda_sgd_step(float *param, const float *grad, size_t n, float lr) {
+    if (!param || !grad || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__sgd_step_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(param, grad, n,
+                                                              lr);
+    return tc__cuda_commit("sgd_step");
+}
+
+int tc__cuda_adam_step(float *param, const float *grad, float *m, float *v,
+                       size_t n, float lr, float beta1, float beta2,
+                       float bias1, float bias2, float epsilon) {
+    if (!param || !grad || !m || !v || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__adam_step_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
+        param, grad, m, v, n, lr, beta1, beta2, bias1, bias2, epsilon);
+    return tc__cuda_commit("adam_step");
+}
+
+int tc__cuda_zero_fill(float *dst, size_t n) {
+    if (!dst || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    return cudaMemset(dst, 0, n * sizeof(float)) == cudaSuccess;
 }

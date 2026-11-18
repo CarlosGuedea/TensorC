@@ -163,8 +163,8 @@ void tc_tensor_nd_free(tc_tensor_nd *tensor) {
     free(tensor->data);
     free(tensor->grad);
 #ifdef TENSORC_HAS_CUDA
-    tc__cuda_free(tensor->dev_data);
-    tc__cuda_free(tensor->dev_grad);
+    tc__cuda_free(tensor->dev_data, tensor->size);
+    tc__cuda_free(tensor->dev_grad, tensor->size);
 #endif
     free(tensor);
 }
@@ -365,6 +365,16 @@ int tc_tensor_nd_requires_grad(const tc_tensor_nd *tensor) {
 
 void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor) {
     if (tensor && tensor->grad) {
+#ifdef TENSORC_HAS_CUDA
+        /* Si el gradiente ya tiene buffer de device, se pone a cero ahí
+         * mismo y la copia host queda obsoleta (evita subir ceros). */
+        if (tensor->dev_grad && tc_cuda_available() &&
+            tc__cuda_zero_fill(tensor->dev_grad, tensor->size)) {
+            tensor->dev_grad_valid = 1;
+            tensor->host_grad_valid = 0;
+            return;
+        }
+#endif
         memset(tensor->grad, 0, tensor->size * sizeof(float));
 #ifdef TENSORC_HAS_CUDA
         tensor->host_grad_valid = 1;
@@ -955,6 +965,19 @@ tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
                                             prediction,
                                             target);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    /* Reducción en device: la loss nunca baja a host si no la leen. */
+    if (tc_cuda_available() && ND_CUDA_RESIDENT(prediction) &&
+        nd_cuda_dev_data((tc_tensor_nd *)prediction) &&
+        nd_cuda_dev_data((tc_tensor_nd *)target) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_cross_entropy_forward(prediction->dev_data,
+                                       target->dev_data, result->dev_data,
+                                       prediction->size, rows)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
     ND_SYNC_DATA(prediction);
     ND_SYNC_DATA(target);
     for (size_t r = 0; r < rows; ++r)
@@ -1704,6 +1727,29 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
             nd_cuda_produced_grad(a);
             return 1;
         }
+        case TC_ND_OP_CROSS_ENTROPY: {
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+                return 0;
+            const int want_a = a->requires_grad && a->grad;
+            const int want_b = b->requires_grad && b->grad;
+            if (!want_a && !want_b) return 1;
+            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b) ||
+                !nd_cuda_dev_grad(tensor))
+                return 0;
+            if (want_a && !nd_cuda_dev_grad(a)) return 0;
+            if (want_b && !nd_cuda_dev_grad(b)) return 0;
+            if (!tc__cuda_cross_entropy_backward(
+                    a->dev_data, b->dev_data, tensor->dev_grad,
+                    want_a ? a->dev_grad : NULL,
+                    want_b ? b->dev_grad : NULL,
+                    a->size, rows, want_a, want_b))
+                return 0;
+            if (want_a) nd_cuda_produced_grad(a);
+            if (want_b) nd_cuda_produced_grad(b);
+            return 1;
+        }
         case TC_ND_OP_LAYERNORM: {
             if (!a->requires_grad || !a->grad) return 1;
             if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
@@ -2316,6 +2362,12 @@ int tc_tensor_nd_backward(tc_tensor_nd *loss) {
     for (size_t i = 0; i < topology.count; ++i)
         if (topology.items[i]->requires_grad) tc_tensor_nd_zero_grad(topology.items[i]);
     loss->grad[0] = 1.0f;
+#ifdef TENSORC_HAS_CUDA
+    /* La semilla se escribe en host: esa copia manda sobre la de device
+     * (zero_grad pudo haber dejado la copia de device como la válida). */
+    loss->host_grad_valid = 1;
+    loss->dev_grad_valid = 0;
+#endif
     for (size_t i = topology.count; i > 0; --i) backward_node(topology.items[i - 1]);
     free(topology.items);
     return 1;
@@ -2338,6 +2390,13 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name) {
 void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate) {
     if (!param || !param->grad) return;
 #ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && nd_cuda_dev_data(param) &&
+        nd_cuda_dev_grad(param) &&
+        tc__cuda_sgd_step(param->dev_data, param->dev_grad, param->size,
+                          learning_rate)) {
+        nd_cuda_produced_data(param);
+        return;
+    }
     nd_cuda_host_data(param);
     nd_cuda_host_grad(param);
 #endif
@@ -2485,6 +2544,14 @@ struct tc_tensor_nd_optimizer {
     size_t count;
     float learning_rate;
     unsigned long step_count;
+#ifdef TENSORC_HAS_CUDA
+    /* Momentos residentes en device; mv_on_device[i]=1 significa que la
+     * copia al día de m[i]/v[i] es la de device (la de host está obsoleta
+     * y se resincroniza si un paso debe caer a CPU). */
+    float **dev_m;
+    float **dev_v;
+    unsigned char *mv_on_device;
+#endif
 };
 
 tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
@@ -2502,6 +2569,17 @@ tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
         tc_tensor_nd_optimizer_free(optimizer);
         return NULL;
     }
+#ifdef TENSORC_HAS_CUDA
+    optimizer->dev_m = (float **)calloc(count, sizeof(float *));
+    optimizer->dev_v = (float **)calloc(count, sizeof(float *));
+    optimizer->mv_on_device =
+        (unsigned char *)calloc(count ? count : 1, sizeof(unsigned char));
+    if ((count > 0) &&
+        (!optimizer->dev_m || !optimizer->dev_v || !optimizer->mv_on_device)) {
+        tc_tensor_nd_optimizer_free(optimizer);
+        return NULL;
+    }
+#endif
     optimizer->count = count;
     for (size_t i = 0; i < count; ++i) {
         optimizer->params[i] = params[i];
@@ -2531,6 +2609,53 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
         float *m = optimizer->m[i];
         float *v = optimizer->v[i];
 #ifdef TENSORC_HAS_CUDA
+        /* Ruta GPU: los momentos viven en device junto al parámetro; el
+         * host solo se resincroniza si hay que caer al camino de CPU. */
+        if (tc_cuda_available()) {
+            if (!optimizer->dev_m[i]) {
+                optimizer->dev_m[i] = tc__cuda_alloc(param->size);
+                if (optimizer->dev_m[i] &&
+                    !tc__cuda_copy_h2d(optimizer->dev_m[i], m, param->size)) {
+                    tc__cuda_free(optimizer->dev_m[i], param->size);
+                    optimizer->dev_m[i] = NULL;
+                }
+            }
+            if (!optimizer->dev_v[i]) {
+                optimizer->dev_v[i] = tc__cuda_alloc(param->size);
+                if (optimizer->dev_v[i] &&
+                    !tc__cuda_copy_h2d(optimizer->dev_v[i], v, param->size)) {
+                    tc__cuda_free(optimizer->dev_v[i], param->size);
+                    optimizer->dev_v[i] = NULL;
+                }
+            }
+            if (optimizer->dev_m[i] && optimizer->dev_v[i] &&
+                nd_cuda_dev_data(param) && nd_cuda_dev_grad(param)) {
+                if (!tc__cuda_adam_step(
+                        param->dev_data, param->dev_grad,
+                        optimizer->dev_m[i], optimizer->dev_v[i],
+                        param->size, optimizer->learning_rate, beta1, beta2,
+                        bias1, bias2, epsilon)) {
+                    fprintf(stderr,
+                            "TensorC CUDA: adam_step falló a mitad del "
+                            "paso; parámetros irrecuperables.\n");
+                    abort();
+                }
+                optimizer->mv_on_device[i] = 1;
+                nd_cuda_produced_data(param);
+                ++updated;
+                continue;
+            }
+        }
+        if (optimizer->mv_on_device[i]) {
+            /* Caída a CPU con momentos en device: bajarlos primero. */
+            if (optimizer->dev_m[i] &&
+                !tc__cuda_copy_d2h(m, optimizer->dev_m[i], param->size))
+                abort();
+            if (optimizer->dev_v[i] &&
+                !tc__cuda_copy_d2h(v, optimizer->dev_v[i], param->size))
+                abort();
+            optimizer->mv_on_device[i] = 0;
+        }
         nd_cuda_host_data(param);
         nd_cuda_host_grad(param);
 #endif
@@ -2556,7 +2681,18 @@ void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer) {
     for (size_t i = 0; i < optimizer->count; ++i) {
         free(optimizer->m ? optimizer->m[i] : NULL);
         free(optimizer->v ? optimizer->v[i] : NULL);
+#ifdef TENSORC_HAS_CUDA
+        const size_t psize =
+            optimizer->params[i] ? optimizer->params[i]->size : 0;
+        tc__cuda_free(optimizer->dev_m ? optimizer->dev_m[i] : NULL, psize);
+        tc__cuda_free(optimizer->dev_v ? optimizer->dev_v[i] : NULL, psize);
+#endif
     }
+#ifdef TENSORC_HAS_CUDA
+    free(optimizer->dev_m);
+    free(optimizer->dev_v);
+    free(optimizer->mv_on_device);
+#endif
     free(optimizer->m);
     free(optimizer->v);
     free(optimizer->params);

@@ -24,6 +24,7 @@ defecto y el host solo sincroniza cuando lee datos).
 | `relu` / `sigmoid` / `tanh` | ✔ | ✔ | kernels propios |
 | `softmax` (última dimensión) | ✔ | ✔ | kernel propio (un hilo por fila) |
 | `layer_norm` (última dimensión) | ✔ | ✔ | kernel propio (un hilo por fila) |
+| `rms_norm` (última dimensión, eps 1e-6) | ✔ | ✔ | kernel propio (un hilo por fila) |
 | `attention` (single y multi-cabeza) | ✔ | ✔ | GEMM batidas cuBLAS + softmax causal propio |
 | `permute` / `transpose` | ✔ | ✔ | kernel propio (biyección por índices) |
 | `reshape` | ✔ | ✔ | copia device→device / acumulación |

@@ -6,10 +6,11 @@ camino genérico ante cualquier fallo de infraestructura (sin GPU, sin
 memoria de device). La API pública no cambia: el mismo código y las mismas
 pruebas corren en CPU o GPU según cómo se compiló la biblioteca.
 
-Estado: **v1 validada en la máquina con GPU** (RTX A2000 Laptop GPU,
+Estado: **v2 validada en la máquina con GPU** (RTX A2000 Laptop GPU,
 sm_86, bajo WSL2): suite 11/11 normal y 11/11 con `TC_CUDA_MIN_ELEMS=0`,
 y benchmarks medidos contra la línea base CPU (ver "Resultados medidos"
-más abajo).
+más abajo). La v2 añade atención, `layer_norm`, permute/transpose y
+reshape en GPU: el bloque Transformer completo vive en device.
 
 ## Qué corre en GPU
 
@@ -19,12 +20,20 @@ más abajo).
 | `add` / `mul` con broadcasting | ✔ | ✔ | kernels propios |
 | `relu` / `sigmoid` / `tanh` | ✔ | ✔ | kernels propios |
 | `softmax` (última dimensión) | ✔ | ✔ | kernel propio (un hilo por fila) |
+| `layer_norm` (última dimensión) | ✔ | ✔ | kernel propio (un hilo por fila) |
+| `attention` (single y multi-cabeza) | ✔ | ✔ | GEMM batidas cuBLAS + softmax causal propio |
+| `permute` / `transpose` | ✔ | ✔ | kernel propio (biyección por índices) |
+| `reshape` | ✔ | ✔ | copia device→device / acumulación |
 
-El resto (`conv2d`, pooling, `layer_norm`, `slice`, `concat`, `transpose`,
-`permute`, atención, reducciones) sigue en CPU en esta v1; al componerse de
-primitivas públicas, la atención multi-cabeza y el bloque Transformer ya se
-benefician del GEMM y de los elementwise en GPU sin kernels nuevos. Umbral
-por defecto para elementwise: 16 384 elementos.
+El resto (`conv2d`, pooling, `slice`, `concat`, `cross_entropy`,
+reducciones, pasos de optimizador) sigue en CPU en esta v2.
+
+**Regla de residencia**: además del umbral de tamaño (16 384 elementos por
+defecto), una op va a GPU si su entrada ya reside en device — caer a CPU en
+medio de una cadena pagaría el par de copias D2H+H2D por puro traslado. Es
+lo que mantiene el bloque Transformer completo en device: sus tensores
+intermedios (p. ej. 196 K elementos con dim 64, seq 64, batch 48) y las
+ops pequeñas entre GEMM nunca bajan al host.
 
 ## Modelo de memoria perezoso
 
@@ -120,28 +129,39 @@ sobreestimar los factores).
   warmup): CPU genérico 30.767 ms → GPU 0.914 ms, **~34×**, checksum
   idéntico (0.335800). GPU limitada aquí por la sync por op, no por
   cuBLAS puro.
-- **LLM** (`examples/char_llm_demo.py`, dim 64, 2 bloques): CPU 2047
-  ms/paso (30 pasos, 61.4 s) → GPU 658 ms/paso, **~3.1×**; la loss
-  converge igual (3.36→2.37 en 300 pasos GPU). Ganancia modesta por
-  Amdahl: la atención y `layer_norm` siguen en CPU y dominan el paso —
-  son el siguiente candidato de porte.
+- **LLM** (`examples/char_llm_demo.py`, dim 64, 2 bloques, 2 cabezas,
+  seq 64, batch 48): CPU 2047 ms/paso → **309 ms/paso con la v2**
+  (**~6.6×**); la loss converge igual (3.355→2.372 en 300 pasos GPU).
+  Desglose: la v1 (solo matmul/elementwise en GPU) daba 658 ms/paso
+  (~3.1×); llevar atención + `layer_norm` + permute + reshape a GPU más
+  que dobló esa ganancia al eliminar las idas y vueltas host↔device del
+  bloque. Lo que queda en CPU (cross-entropy, paso de Adam, embedding)
+  explica el resto por Amdahl.
 
 Los pasos 3 (compute-sanitizer) y los benchmarks restantes del paso 4
 (`benchmark_vs_numpy.py`, CNN MNIST) quedan pendientes; la suite 11/11 y
 las dos mediciones de arriba son las que respaldan el estado "validado".
 
-## Limitaciones conocidas de la v1
+## Limitaciones conocidas de la v2
 
 - Un solo dispositivo por proceso; sin streams asíncronos (cada op
-  sincroniza: semántica todo-o-nada, simple y segura).
-- Softmax usa un hilo por fila; si el perfil lo pide, el siguiente paso es
-  un bloque por fila con reducciones en memoria compartida.
-- `conv2d` sigue en CPU: es el siguiente candidato (cuDNN o im2col+cuBLAS,
-  espejando la ruta Accelerate), pero primero medir: con matmul y
-  elementwise en GPU puede que ya no domine ningún perfil.
+  sincroniza: semántica todo-o-nada, simple y segura). El bloque
+  Transformer lanza ~60 ops sincronizadas por paso: relajar a streams es
+  la siguiente palanca de rendimiento.
+- Softmax, `layer_norm` y el dS de atención usan un hilo por fila; si el
+  perfil lo pide, el siguiente paso es un bloque por fila con reducciones
+  en memoria compartida (o warp por fila para widths ≤ 1024).
+- La atención reserva dos scratch de `batch·q_seq·k_seq` floats por
+  llamada (P y dP en el backward); una variante estilo flash-attention
+  evitaría materializar scores — solo si el perfil lo justifica.
+- `conv2d` sigue en CPU: candidato posterior (cuDNN o im2col+cuBLAS,
+  espejando la ruta Accelerate), pero primero medir.
+- `cross_entropy` y los pasos de optimizador (SGD/Adam) siguen en CPU: en
+  el LLM ya son lo dominante del tiempo restante; portarlos es mecánico
+  si se quiere exprimir más.
 - Las transferencias D2H perezosas convierten ops encadenadas en casi
-  libres, pero una alternancia GPU→CPU→GPU por ops sin kernel (p. ej.
-  `layer_norm` entre dos GEMM) paga dos copias; medir antes de optimizar.
+  libres, pero una alternancia GPU→CPU→GPU por ops sin kernel paga dos
+  copias; la regla de residencia minimiza estos cruces.
 
 ## Archivos
 

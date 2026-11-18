@@ -118,6 +118,56 @@ int tc__cuda_softmax_forward(const float *x, float *out, size_t rows,
 int tc__cuda_softmax_backward(const float *y, const float *g, float *gx,
                               size_t rows, size_t classes);
 
+/* Layer normalization sobre la última dimensión (`rows` filas de `width`
+ * elementos), misma fórmula en dos pasadas que el camino de CPU. El
+ * backward acumula sobre gx. */
+int tc__cuda_layer_norm_forward(const float *x, float *out, size_t rows,
+                                size_t width);
+int tc__cuda_layer_norm_backward(const float *x, const float *g, float *gx,
+                                 size_t rows, size_t width);
+
+/*
+ * Atención de producto punto escalado sobre lotes [batch, seq, depth]:
+ * softmax((Q Kᵀ)/sqrt(depth) [+ máscara causal]) V. Las GEMM internas son
+ * batidas con strides vía cuBLAS; el softmax causal es un kernel propio.
+ * El backward ACUMULA sobre dq/dk/dv (punteros NULL = no se pide ese
+ * gradiente) y recomputa P igual que el camino de CPU.
+ */
+int tc__cuda_attention_forward(const float *q, const float *k,
+                               const float *v, float *out, size_t batch,
+                               size_t q_seq, size_t k_seq, size_t depth,
+                               size_t v_depth, int causal);
+int tc__cuda_attention_backward(const float *q, const float *k,
+                                const float *v, const float *dout,
+                                float *dq, float *dk, float *dv,
+                                size_t batch, size_t q_seq, size_t k_seq,
+                                size_t depth, size_t v_depth, int causal);
+
+/*
+ * Descriptor de permutación de ejes (réplica del mapeo de
+ * tc_tensor_nd_permute): el índice lineal de entrada se descompone con
+ * in_shape/in_strides y se reensambla con out_strides vía axes.
+ */
+typedef struct {
+    int ndim;
+    size_t in_shape[TC_CUDA_MAX_DIMS];
+    size_t in_strides[TC_CUDA_MAX_DIMS];
+    size_t out_strides[TC_CUDA_MAX_DIMS];
+    size_t axes[TC_CUDA_MAX_DIMS];
+} tc_cuda_permute_desc;
+
+/* Permute/transpose (transpose usa axes = {1, 0}). El backward acumula
+ * sobre gx; la biyección garantiza un único escritor por elemento. */
+int tc__cuda_permute_forward(const float *in, float *out, size_t n,
+                             const tc_cuda_permute_desc *desc);
+int tc__cuda_permute_backward(const float *g, float *gx, size_t n,
+                              const tc_cuda_permute_desc *desc);
+
+/* Copia device→device (reshape forward) y acumulación elemento a elemento
+ * gx[i] += g[i] (backward de reshape). */
+int tc__cuda_copy_d2d(float *dst_dev, const float *src_dev, size_t count);
+int tc__cuda_accumulate(float *dst, const float *src, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

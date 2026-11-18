@@ -82,6 +82,21 @@ tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input);
  */
 tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
                                          const tc_tensor_nd *target);
+/*
+ * Embedding: gather de filas de `table` [vocab, dim] según los índices
+ * enteros de `ids` (floats exactos); la salida es ids->shape + [dim].
+ * Solo la tabla recibe gradiente (scatter-add por fila).
+ */
+tc_tensor_nd *tc_tensor_nd_embedding(const tc_tensor_nd *table,
+                                     const tc_tensor_nd *ids);
+/*
+ * Cross-entropy con objetivos enteros: prediction [rows, classes] trae
+ * probabilidades e ids [rows] la clase correcta de cada fila. Equivale a
+ * cross_entropy con one-hot sin materializar los objetivos; ids no recibe
+ * gradiente.
+ */
+tc_tensor_nd *tc_tensor_nd_cross_entropy_sparse(const tc_tensor_nd *prediction,
+                                                const tc_tensor_nd *ids);
 /* Reshapes as a graph operation; the total element count must match. */
 tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
                                       const size_t *shape, size_t ndim);
@@ -175,6 +190,9 @@ tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
                                                     float learning_rate);
 /* Applies one Adam step. Returns the number of updated parameters. */
 int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer);
+/* Cambia el learning rate en caliente (warmup, decaimiento, schedules). */
+void tc_tensor_nd_optimizer_set_lr(tc_tensor_nd_optimizer *optimizer,
+                                   float learning_rate);
 void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer);
 
 /*

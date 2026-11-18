@@ -37,7 +37,9 @@ typedef enum {
     TC_ND_OP_LAYERNORM,
     TC_ND_OP_TRANSPOSE,
     TC_ND_OP_ATTENTION,
-    TC_ND_OP_PERMUTE
+    TC_ND_OP_PERMUTE,
+    TC_ND_OP_EMBEDDING,
+    TC_ND_OP_CROSS_ENTROPY_SPARSE
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -1426,6 +1428,98 @@ tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
     return result;
 }
 
+/*
+ * Embedding: gather de filas de una tabla [vocab, dim] según los índices de
+ * `ids`. Los índices viajan como floats exactos (0 <= v < vocab, v entera);
+ * `ids` puede tener cualquier rango r y la salida es ids->shape + [dim].
+ * `ids` no recibe gradiente; la tabla acumula scatter-add por fila.
+ */
+tc_tensor_nd *tc_tensor_nd_embedding(const tc_tensor_nd *table,
+                                     const tc_tensor_nd *ids) {
+    if (!table || !ids || table->ndim != 2 || ids->ndim == 0 ||
+        ids->ndim > 7)
+        return NULL;
+    const size_t vocab = table->shape[0];
+    const size_t dim = table->shape[1];
+    /* La validación de índices se hace en host: ids es pequeño (batch*seq)
+     * y su copia de device, si existe, se sube después ya validada. */
+    ND_SYNC_DATA(ids);
+    for (size_t i = 0; i < ids->size; ++i) {
+        const float v = ids->data[i];
+        if (v < 0.0f || v >= (float)vocab || v != floorf(v)) return NULL;
+    }
+    size_t out_shape[8];
+    memcpy(out_shape, ids->shape, ids->ndim * sizeof(size_t));
+    out_shape[ids->ndim] = dim;
+    tc_tensor_nd *result = binary_result(out_shape, ids->ndim + 1,
+                                            TC_ND_OP_EMBEDDING, table, ids);
+    if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && ND_CUDA_RESIDENT(table) &&
+        nd_cuda_dev_data((tc_tensor_nd *)table) &&
+        nd_cuda_dev_data((tc_tensor_nd *)ids) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_embedding_forward(table->dev_data, ids->dev_data,
+                                   result->dev_data, ids->size, dim)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(table);
+    for (size_t i = 0; i < ids->size; ++i) {
+        const size_t row = (size_t)ids->data[i];
+        memcpy(result->data + i * dim, table->data + row * dim,
+               dim * sizeof(float));
+    }
+    return result;
+}
+
+/*
+ * Cross-entropy con objetivos enteros: prediction [rows, classes] ya trae
+ * probabilidades (softmax aplicado) e ids [rows] trae la clase correcta de
+ * cada fila (float entero exacto). loss = -mean log p[i, y_i]. Equivale a
+ * tc_tensor_nd_cross_entropy con one-hot sin materializar la matriz de
+ * objetivos (vocab grande). ids no recibe gradiente.
+ */
+tc_tensor_nd *tc_tensor_nd_cross_entropy_sparse(const tc_tensor_nd *prediction,
+                                                const tc_tensor_nd *ids) {
+    if (!prediction || !ids || prediction->ndim == 0) return NULL;
+    const size_t classes = prediction->shape[prediction->ndim - 1];
+    if (classes == 0) return NULL;
+    const size_t rows = prediction->size / classes;
+    if (rows == 0 || ids->size != rows) return NULL;
+    ND_SYNC_DATA(ids);
+    for (size_t i = 0; i < rows; ++i) {
+        const float v = ids->data[i];
+        if (v < 0.0f || v >= (float)classes || v != floorf(v)) return NULL;
+    }
+    const size_t shape[] = {1};
+    tc_tensor_nd *result = binary_result(shape, 1,
+                                            TC_ND_OP_CROSS_ENTROPY_SPARSE,
+                                            prediction, ids);
+    if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    /* Reducción en device: la loss nunca baja a host si no la leen. */
+    if (tc_cuda_available() && ND_CUDA_RESIDENT(prediction) &&
+        nd_cuda_dev_data((tc_tensor_nd *)prediction) &&
+        nd_cuda_dev_data((tc_tensor_nd *)ids) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_sparse_ce_forward(prediction->dev_data, ids->dev_data,
+                                   result->dev_data, rows, classes)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(prediction);
+    for (size_t r = 0; r < rows; ++r) {
+        const size_t y = (size_t)ids->data[r];
+        const float p = prediction->data[r * classes + y];
+        result->data[0] -= logf(p > 1e-7f ? p : 1e-7f);
+    }
+    result->data[0] /= (float)rows;
+    return result;
+}
+
 #ifdef TENSORC_HAS_ACCELERATE
 /*
  * Backward vía im2col + GEMM:
@@ -1824,6 +1918,38 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
                 return 0;
             if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_grad(a)) return 0;
             if (!tc__cuda_accumulate(a->dev_grad, tensor->dev_grad, a->size))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        case TC_ND_OP_EMBEDDING: {
+            /* a = tabla [vocab, dim], b = ids (sin gradiente). */
+            if (!a->requires_grad || !a->grad) return 1;
+            if (tensor->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+                return 0;
+            const size_t dim = a->shape[1];
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(b) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_embedding_backward(tensor->dev_grad, b->dev_data,
+                                             a->dev_grad, b->size, dim))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        case TC_ND_OP_CROSS_ENTROPY_SPARSE: {
+            /* a = prediction [rows, classes], b = ids (sin gradiente). */
+            if (!a->requires_grad || !a->grad) return 1;
+            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+                return 0;
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b) ||
+                !nd_cuda_dev_grad(tensor) || !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_sparse_ce_backward(a->dev_data, b->dev_data,
+                                             tensor->dev_grad, a->dev_grad,
+                                             rows, classes))
                 return 0;
             nd_cuda_produced_grad(a);
             return 1;
@@ -2339,6 +2465,33 @@ static void backward_node(tc_tensor_nd *tensor) {
             free(dp);
             break;
         }
+        case TC_ND_OP_EMBEDDING: {
+            /* Scatter-add sobre la tabla: cada índice acumula el gradiente
+             * de su fila de salida. ids (b) no recibe gradiente. */
+            if (a->requires_grad && a->grad) {
+                const size_t dim = a->shape[1];
+                for (size_t i = 0; i < b->size; ++i) {
+                    const size_t row = (size_t)b->data[i];
+                    for (size_t d = 0; d < dim; ++d)
+                        add_grad(a, row * dim + d, tensor->grad[i * dim + d]);
+                }
+            }
+            break;
+        }
+        case TC_ND_OP_CROSS_ENTROPY_SPARSE: {
+            /* Solo la clase correcta de cada fila recibe gradiente:
+             * dp[i,y] = -(g/rows) / p[i,y]. ids (b) no recibe gradiente. */
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            const float scale = tensor->grad[0] / (float)rows;
+            for (size_t r = 0; r < rows; ++r) {
+                const size_t y = (size_t)b->data[r];
+                const float p = a->data[r * classes + y];
+                add_grad(a, r * classes + y,
+                         -scale / (p > 1e-7f ? p : 1e-7f));
+            }
+            break;
+        }
         case TC_ND_OP_LEAF:
         default:
             break;
@@ -2674,6 +2827,11 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
         ++updated;
     }
     return updated;
+}
+
+void tc_tensor_nd_optimizer_set_lr(tc_tensor_nd_optimizer *optimizer,
+                                   float learning_rate) {
+    if (optimizer) optimizer->learning_rate = learning_rate;
 }
 
 void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer) {

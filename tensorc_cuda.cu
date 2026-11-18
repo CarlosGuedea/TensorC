@@ -1008,6 +1008,108 @@ int tc__cuda_cross_entropy_backward(const float *p, const float *t,
     return tc__cuda_commit("cross_entropy_backward");
 }
 
+/* Un hilo por elemento de salida: copia la fila ids[i] de la tabla. */
+__global__ static void tc__embedding_fwd_kernel(const float *table,
+                                                const float *ids, float *out,
+                                                size_t n, size_t dim) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * dim) return;
+    const size_t row = (size_t)ids[i / dim];
+    out[i] = table[row * dim + (i % dim)];
+}
+
+/* Scatter-add atómico: filas repetidas (mismo token varias veces en el
+ * lote) deben acumular su gradiente, no pisarlo. */
+__global__ static void tc__embedding_bwd_kernel(const float *g,
+                                                const float *ids,
+                                                float *gtable, size_t n,
+                                                size_t dim) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * dim) return;
+    const size_t row = (size_t)ids[i / dim];
+    atomicAdd(&gtable[row * dim + (i % dim)], g[i]);
+}
+
+/* Reducción a dos niveles como tc__ce_fwd_kernel pero un elemento por fila:
+ * solo contribuye la clase correcta. El wrapper pone `out` a cero antes. */
+__global__ static void tc__sparse_ce_fwd_kernel(const float *p,
+                                                const float *ids, float *out,
+                                                size_t rows,
+                                                size_t classes) {
+    __shared__ float block_sum[TC_CUDA_THREADS];
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    float value = 0.0f;
+    if (r < rows) {
+        const size_t y = (size_t)ids[r];
+        const float pi = p[r * classes + y] > 1e-7f ? p[r * classes + y]
+                                                    : 1e-7f;
+        value = -logf(pi) / (float)rows;
+    }
+    block_sum[threadIdx.x] = value;
+    __syncthreads();
+    for (unsigned int s = TC_CUDA_THREADS / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) block_sum[threadIdx.x] += block_sum[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out, block_sum[0]);
+}
+
+/* Un hilo por fila, un único elemento escrito: no hacen falta atómicos. */
+__global__ static void tc__sparse_ce_bwd_kernel(const float *p,
+                                                const float *ids,
+                                                const float *g, float *gp,
+                                                size_t rows,
+                                                size_t classes) {
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const size_t y = (size_t)ids[r];
+    const float pi = p[r * classes + y] > 1e-7f ? p[r * classes + y] : 1e-7f;
+    gp[r * classes + y] += -g[0] / (float)rows / pi;
+}
+
+int tc__cuda_embedding_forward(const float *table, const float *ids,
+                               float *out, size_t n, size_t dim) {
+    if (!table || !ids || !out || dim == 0 || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__embedding_fwd_kernel<<<tc__grid_for(n * dim), TC_CUDA_THREADS>>>(
+        table, ids, out, n, dim);
+    return tc__cuda_commit("embedding_forward");
+}
+
+int tc__cuda_embedding_backward(const float *g, const float *ids,
+                                float *gtable, size_t n, size_t dim) {
+    if (!g || !ids || !gtable || dim == 0 || tc__cuda_state <= 0) return 0;
+    if (n == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__embedding_bwd_kernel<<<tc__grid_for(n * dim), TC_CUDA_THREADS>>>(
+        g, ids, gtable, n, dim);
+    return tc__cuda_commit("embedding_backward");
+}
+
+int tc__cuda_sparse_ce_forward(const float *p, const float *ids, float *out,
+                               size_t rows, size_t classes) {
+    if (!p || !ids || !out || classes == 0 || tc__cuda_state <= 0) return 0;
+    if (rows == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    if (cudaMemset(out, 0, sizeof(float)) != cudaSuccess) return 0;
+    tc__sparse_ce_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
+        p, ids, out, rows, classes);
+    return tc__cuda_commit("sparse_ce_forward");
+}
+
+int tc__cuda_sparse_ce_backward(const float *p, const float *ids,
+                                const float *g, float *gp, size_t rows,
+                                size_t classes) {
+    if (!p || !ids || !g || !gp || classes == 0 || tc__cuda_state <= 0)
+        return 0;
+    if (rows == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__sparse_ce_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
+        p, ids, g, gp, rows, classes);
+    return tc__cuda_commit("sparse_ce_backward");
+}
+
 int tc__cuda_sgd_step(float *param, const float *grad, size_t n, float lr) {
     if (!param || !grad || tc__cuda_state <= 0) return 0;
     if (n == 0) return 1;

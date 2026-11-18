@@ -188,6 +188,28 @@ int tc__cuda_cross_entropy_backward(const float *p, const float *t,
                                     size_t n, size_t rows, int want_p,
                                     int want_t);
 
+/*
+ * Embedding (gather de filas): out[i,:] = table[ids[i],:] para n índices
+ * con vectores de `dim` floats. El backward es scatter-add sobre las filas
+ * de la tabla (atómico: filas repetidas acumulan) y ACUMULA sobre gtable.
+ */
+int tc__cuda_embedding_forward(const float *table, const float *ids,
+                               float *out, size_t n, size_t dim);
+int tc__cuda_embedding_backward(const float *g, const float *ids,
+                                float *gtable, size_t n, size_t dim);
+
+/*
+ * Cross-entropy con objetivos enteros: p es [rows, classes] aplanado con
+ * probabilidades, ids[r] es la clase correcta (float entero). El forward es
+ * la reducción -mean log p[r, y_r] (el wrapper pone `out` a cero antes);
+ * el backward ACUMULA solo sobre gp[r, y_r] con g el gradiente escalar.
+ */
+int tc__cuda_sparse_ce_forward(const float *p, const float *ids, float *out,
+                               size_t rows, size_t classes);
+int tc__cuda_sparse_ce_backward(const float *p, const float *ids,
+                                const float *g, float *gp, size_t rows,
+                                size_t classes);
+
 /* Pasos de optimizador en device (in-place sobre param; Adam además
  * actualiza sus momentos m/v en device). bias1/bias2 son las correcciones
  * 1−beta^t ya calculadas en host. */

@@ -19,3 +19,9 @@ __pycache__/
 .venv/
 venv/
 benchmarks/data/quijote.txt
+benchmarks/data/python.jsonl
+benchmarks/data/shell.txt
+benchmarks/data/code_tokenizer.json
+benchmarks/data/code_tokens.npy
+benchmarks/data/code_llm.ckpt
+benchmarks/data/code_llm_config.json

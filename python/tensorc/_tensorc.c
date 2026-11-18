@@ -276,6 +276,8 @@ BINARY_OP(mul, tc_tensor_nd_mul)
 BINARY_OP(matmul, tc_tensor_nd_matmul)
 BINARY_OP(mse_loss, tc_tensor_nd_mse_loss)
 BINARY_OP(cross_entropy, tc_tensor_nd_cross_entropy)
+BINARY_OP(embedding, tc_tensor_nd_embedding)
+BINARY_OP(cross_entropy_sparse, tc_tensor_nd_cross_entropy_sparse)
 
 static PyObject *tensor_relu(TensorObject *self, PyObject *args) {
     (void)args;
@@ -520,6 +522,11 @@ static PyMethodDef tensor_methods[] = {
     {"mse_loss", (PyCFunction)tensor_mse_loss, METH_VARARGS, "MSE loss."},
     {"cross_entropy", (PyCFunction)tensor_cross_entropy, METH_VARARGS,
      "Mean cross-entropy over rows."},
+    {"embedding", (PyCFunction)tensor_embedding, METH_VARARGS,
+     "embedding(ids): gather de filas de la tabla [vocab, dim] según ids."},
+    {"cross_entropy_sparse", (PyCFunction)tensor_cross_entropy_sparse,
+     METH_VARARGS,
+     "cross_entropy_sparse(ids): CE con clase entera por fila [rows]."},
     {"maxpool2d", (PyCFunction)tensor_maxpool2d, METH_VARARGS,
      "maxpool2d(pool_h, pool_w)"},
     {"avgpool2d", (PyCFunction)tensor_avgpool2d, METH_VARARGS,
@@ -1076,6 +1083,13 @@ static PyObject *optimizer_step(OptimizerObject *self, PyObject *args) {
         tc_tensor_nd_optimizer_step(self->optimizer));
 }
 
+static PyObject *optimizer_set_lr(OptimizerObject *self, PyObject *args) {
+    float learning_rate;
+    if (!PyArg_ParseTuple(args, "f", &learning_rate)) return NULL;
+    tc_tensor_nd_optimizer_set_lr(self->optimizer, learning_rate);
+    Py_RETURN_NONE;
+}
+
 static PyObject *optimizer_new(PyTypeObject *type, PyObject *args,
                                PyObject *kwargs) {
     static char *names[] = {"params", "learning_rate", NULL};
@@ -1124,6 +1138,8 @@ static PyObject *optimizer_new(PyTypeObject *type, PyObject *args,
 static PyMethodDef optimizer_methods[] = {
     {"step", (PyCFunction)optimizer_step, METH_NOARGS,
      "Aplica un paso de Adam; devuelve cuántos parámetros se actualizaron."},
+    {"set_lr", (PyCFunction)optimizer_set_lr, METH_VARARGS,
+     "set_lr(lr) -> cambia el learning rate (warmup, schedules)."},
     {NULL, NULL, 0, NULL}
 };
 

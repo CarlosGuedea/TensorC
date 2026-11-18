@@ -219,14 +219,56 @@ static int test_optimizer_set_lr(void) {
     return ok;
 }
 
+/* loss = sum(rms_norm(x)): ejercita forward y backward de RMSNorm. */
+static float rms_norm_loss_fn(tc_tensor_nd *x) {
+    tc_tensor_nd *out = tc_tensor_nd_rms_norm(x);
+    tc_tensor_nd *loss = out ? tc_tensor_nd_sum(out) : NULL;
+    const float value = loss ? tc_tensor_nd_const_data(loss)[0] : NAN;
+    tc_tensor_nd_free(loss);
+    tc_tensor_nd_free(out);
+    return value;
+}
+
+/* --- rms_norm: valores conocidos y gradiente --- */
+static int test_rms_norm(void) {
+    /* x = [1, 2, 3]: ms = 14/3, s = 1/sqrt(ms + 1e-6). */
+    const size_t shape[] = {1, 3};
+    const float xv[] = {1.0f, 2.0f, 3.0f};
+    tc_tensor_nd *x = tc_tensor_nd_from_data(shape, 2, xv, 1);
+    tc_tensor_nd *out = x ? tc_tensor_nd_rms_norm(x) : NULL;
+    int ok = x && out && tc_tensor_nd_numel(out) == 3;
+    if (ok) {
+        const float s = 1.0f / sqrtf(14.0f / 3.0f + 1e-6f);
+        const float *od = tc_tensor_nd_const_data(out);
+        ok = close_enough(od[0], 1.0f * s) &&
+             close_enough(od[1], 2.0f * s) &&
+             close_enough(od[2], 3.0f * s);
+    }
+    /* Gradiente analítico vs diferencias finitas (loss = sum(out)). */
+    if (ok) {
+        tc_tensor_nd *loss = tc_tensor_nd_sum(out);
+        ok = loss && tc_tensor_nd_backward(loss);
+        tc_tensor_nd_free(loss);
+        ok = ok &&
+             finite_difference(x, rms_norm_loss_fn, tc_tensor_nd_grad(x));
+    }
+    /* Rechazo de entrada nula. */
+    ok = ok && !tc_tensor_nd_rms_norm(NULL);
+    tc_tensor_nd_free(out);
+    tc_tensor_nd_free(x);
+    return ok;
+}
+
 int main(void) {
     const int embedding_ok = test_embedding();
     const int sparse_ce_ok = test_sparse_ce();
     const int set_lr_ok = test_optimizer_set_lr();
+    const int rms_norm_ok = test_rms_norm();
 
     printf("embedding: %s\n", embedding_ok ? "ok" : "error");
     printf("sparse cross entropy: %s\n", sparse_ce_ok ? "ok" : "error");
     printf("optimizer set_lr: %s\n", set_lr_ok ? "ok" : "error");
+    printf("rms_norm: %s\n", rms_norm_ok ? "ok" : "error");
 
-    return (embedding_ok && sparse_ce_ok && set_lr_ok) ? 0 : 1;
+    return (embedding_ok && sparse_ce_ok && set_lr_ok && rms_norm_ok) ? 0 : 1;
 }

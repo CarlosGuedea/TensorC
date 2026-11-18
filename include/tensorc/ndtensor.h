@@ -127,6 +127,8 @@ tc_tensor_nd *tc_tensor_nd_concat(const tc_tensor_nd *const *inputs,
                                   size_t count, size_t axis);
 /* LayerNorm sobre la última dimensión (sin afín; componer con mul/add). */
 tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input);
+/* RMSNorm sobre la última dimensión (sin afín; componer con mul). */
+tc_tensor_nd *tc_tensor_nd_rms_norm(const tc_tensor_nd *input);
 /* Transposición de matriz [M, N] -> [N, M]. */
 tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input);
 /*

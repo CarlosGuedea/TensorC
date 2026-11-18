@@ -130,6 +130,13 @@ int tc__cuda_layer_norm_forward(const float *x, float *out, size_t rows,
 int tc__cuda_layer_norm_backward(const float *x, const float *g, float *gx,
                                  size_t rows, size_t width);
 
+/* RMSNorm sobre la última dimensión (sin resta de media, eps 1e-6), mismo
+ * orden de operaciones que el camino de CPU. El backward acumula sobre gx. */
+int tc__cuda_rms_norm_forward(const float *x, float *out, size_t rows,
+                              size_t width);
+int tc__cuda_rms_norm_backward(const float *x, const float *g, float *gx,
+                               size_t rows, size_t width);
+
 /*
  * Atención de producto punto escalado sobre lotes [batch, seq, depth]:
  * softmax((Q Kᵀ)/sqrt(depth) [+ máscara causal]) V. Las GEMM internas son

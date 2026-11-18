@@ -39,7 +39,8 @@ typedef enum {
     TC_ND_OP_ATTENTION,
     TC_ND_OP_PERMUTE,
     TC_ND_OP_EMBEDDING,
-    TC_ND_OP_CROSS_ENTROPY_SPARSE
+    TC_ND_OP_CROSS_ENTROPY_SPARSE,
+    TC_ND_OP_RMSNORM
 } tc_nd_op;
 
 struct tc_tensor_nd {
@@ -1250,6 +1251,41 @@ tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input) {
 }
 
 /*
+ * RMSNorm sobre la última dimensión (sin afín; componer con mul): cada fila
+ * se escala por 1/sqrt(mean(x²) + eps) con eps = 1e-6 (convención de
+ * Llama/Qwen). A diferencia de layer_norm no resta la media.
+ */
+tc_tensor_nd *tc_tensor_nd_rms_norm(const tc_tensor_nd *input) {
+    if (!input || input->ndim == 0 || input->shape[input->ndim - 1] == 0)
+        return NULL;
+    const size_t width = input->shape[input->ndim - 1];
+    const size_t rows = input->size / width;
+    tc_tensor_nd *result = unary_result(input->shape, input->ndim,
+                                        TC_ND_OP_RMSNORM, input);
+    if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
+        nd_cuda_dev_data((tc_tensor_nd *)input) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_rms_norm_forward(input->dev_data, result->dev_data,
+                                  rows, width)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(input);
+    for (size_t r = 0; r < rows; ++r) {
+        const float *src = input->data + r * width;
+        float *dst = result->data + r * width;
+        float ms = 0.0f;
+        for (size_t j = 0; j < width; ++j) ms += src[j] * src[j];
+        const float scale = 1.0f / sqrtf(ms / (float)width + 1e-6f);
+        for (size_t j = 0; j < width; ++j) dst[j] = src[j] * scale;
+    }
+    return result;
+}
+
+/*
  * Transposición de una matriz (rango 2): [M, N] -> [N, M]. Es la pieza
  * que falta para proyectar en LSTM (x Wᵀ) y para Q Kᵀ en atención.
  */
@@ -1859,6 +1895,21 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
             nd_cuda_produced_grad(a);
             return 1;
         }
+        case TC_ND_OP_RMSNORM: {
+            if (!a->requires_grad || !a->grad) return 1;
+            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+                return 0;
+            const size_t width = a->shape[a->ndim - 1];
+            const size_t rows = a->size / width;
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(a) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_rms_norm_backward(a->dev_data, tensor->dev_grad,
+                                            a->dev_grad, rows, width))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
         case TC_ND_OP_ATTENTION: {
             tc_tensor_nd *q = tensor->parents[0];
             tc_tensor_nd *k = tensor->parents[1];
@@ -2343,6 +2394,26 @@ static void backward_node(tc_tensor_nd *tensor) {
                     add_grad(a, r * width + j,
                              inv_std * (dy[j] - mean_dy - xhat * mean_dy_xhat));
                 }
+            }
+            break;
+        }
+        case TC_ND_OP_RMSNORM: {
+            /* y = x·s con s = (mean(x²)+eps)^(-1/2):
+             * dx = s·dy − s³·x·(dy·x)/width, acumulando por fila. */
+            const size_t width = a->shape[a->ndim - 1];
+            const size_t rows = a->size / width;
+            for (size_t r = 0; r < rows; ++r) {
+                const float *src = a->data + r * width;
+                const float *dy = tensor->grad + r * width;
+                float ms = 0.0f;
+                for (size_t j = 0; j < width; ++j) ms += src[j] * src[j];
+                const float s = 1.0f / sqrtf(ms / (float)width + 1e-6f);
+                float dot = 0.0f;
+                for (size_t j = 0; j < width; ++j) dot += dy[j] * src[j];
+                for (size_t j = 0; j < width; ++j)
+                    add_grad(a, r * width + j,
+                             s * dy[j] - s * s * s * src[j] * dot /
+                                          (float)width);
             }
             break;
         }

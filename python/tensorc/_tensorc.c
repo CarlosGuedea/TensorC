@@ -391,6 +391,17 @@ static PyObject *tensor_layer_norm(TensorObject *self, PyObject *args) {
     return (PyObject *)tensor_wrap(tc_tensor_nd_layer_norm(self->tensor));
 }
 
+static PyObject *tensor_rms_norm(TensorObject *self, PyObject *args) {
+    (void)args;
+    return (PyObject *)tensor_wrap(tc_tensor_nd_rms_norm(self->tensor));
+}
+
+static PyObject *tensor_zero_grad(TensorObject *self, PyObject *args) {
+    (void)args;
+    tc_tensor_nd_zero_grad(self->tensor);
+    Py_RETURN_NONE;
+}
+
 /* concat(others, axis=0): others es un Tensor o una secuencia de Tensor.
    self se concatena primero, seguido de los elementos de others. */
 static PyObject *tensor_concat(TensorObject *self, PyObject *args,
@@ -544,6 +555,10 @@ static PyMethodDef tensor_methods[] = {
      "Transposición de matriz [M, N] -> [N, M]."},
     {"layer_norm", (PyCFunction)tensor_layer_norm, METH_NOARGS,
      "LayerNorm sobre la última dimensión (sin afín)."},
+    {"rms_norm", (PyCFunction)tensor_rms_norm, METH_NOARGS,
+     "RMSNorm sobre la última dimensión (sin afín, eps 1e-6)."},
+    {"zero_grad", (PyCFunction)tensor_zero_grad, METH_NOARGS,
+     "Pone el gradiente acumulado a cero."},
     {"concat", (PyCFunction)tensor_concat, METH_VARARGS | METH_KEYWORDS,
      "concat(others, axis=0): others es un Tensor o secuencia de Tensor."},
     {"attention", (PyCFunction)tensor_attention,

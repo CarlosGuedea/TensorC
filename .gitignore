@@ -25,3 +25,5 @@ benchmarks/data/code_tokenizer.json
 benchmarks/data/code_tokens.npy
 benchmarks/data/code_llm.ckpt
 benchmarks/data/code_llm_config.json
+benchmarks/data/qwen/
+benchmarks/data/*.log

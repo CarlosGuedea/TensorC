@@ -647,6 +647,41 @@ __global__ static void tc__layer_norm_bwd_kernel(const float *x,
 }
 
 /* ------------------------------------------------------------------ */
+/* Kernels de RMSNorm (un hilo por fila): sin resta de media, eps 1e-6. */
+/* Réplica exacta del orden de operaciones del camino de CPU.          */
+/* ------------------------------------------------------------------ */
+
+__global__ static void tc__rms_norm_fwd_kernel(const float *x, float *out,
+                                               size_t rows, size_t width) {
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float *src = x + r * width;
+    float *dst = out + r * width;
+    float ms = 0.0f;
+    for (size_t j = 0; j < width; ++j) ms += src[j] * src[j];
+    const float scale = 1.0f / sqrtf(ms / (float)width + 1e-6f);
+    for (size_t j = 0; j < width; ++j) dst[j] = src[j] * scale;
+}
+
+__global__ static void tc__rms_norm_bwd_kernel(const float *x, const float *g,
+                                               float *gx, size_t rows,
+                                               size_t width) {
+    const size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float *src = x + r * width;
+    const float *dy = g + r * width;
+    float *dx = gx + r * width;
+    float ms = 0.0f, dot = 0.0f;
+    for (size_t j = 0; j < width; ++j) {
+        ms += src[j] * src[j];
+        dot += dy[j] * src[j];
+    }
+    const float s = 1.0f / sqrtf(ms / (float)width + 1e-6f);
+    const float coeff = s * s * s * dot / (float)width;
+    for (size_t j = 0; j < width; ++j) dx[j] += s * dy[j] - coeff * src[j];
+}
+
+/* ------------------------------------------------------------------ */
 /* Kernels de atención: softmax (con máscara causal opcional) sobre las */
 /* filas de la matriz de scores, y el paso dS del backward.            */
 /* ------------------------------------------------------------------ */
@@ -913,6 +948,30 @@ int tc__cuda_layer_norm_backward(const float *x, const float *g, float *gx,
     tc__layer_norm_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, g, gx, rows, width);
     return tc__cuda_commit("layer_norm_backward");
+}
+
+/* ------------------------------------------------------------------ */
+/* Wrappers de RMSNorm.                                                */
+/* ------------------------------------------------------------------ */
+
+int tc__cuda_rms_norm_forward(const float *x, float *out, size_t rows,
+                              size_t width) {
+    if (!x || !out || width == 0 || tc__cuda_state <= 0) return 0;
+    if (rows == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__rms_norm_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
+        x, out, rows, width);
+    return tc__cuda_commit("rms_norm_forward");
+}
+
+int tc__cuda_rms_norm_backward(const float *x, const float *g, float *gx,
+                               size_t rows, size_t width) {
+    if (!x || !g || !gx || width == 0 || tc__cuda_state <= 0) return 0;
+    if (rows == 0) return 1;
+    cudaSetDevice(tc__cuda_current_device);
+    tc__rms_norm_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
+        x, g, gx, rows, width);
+    return tc__cuda_commit("rms_norm_backward");
 }
 
 /* ------------------------------------------------------------------ */

@@ -28,11 +28,14 @@ defecto y el host solo sincroniza cuando lee datos).
 | `permute` / `transpose` | ✔ | ✔ | kernel propio (biyección por índices) |
 | `reshape` | ✔ | ✔ | copia device→device / acumulación |
 | `cross_entropy` | ✔ | ✔ | reducción a dos niveles (bloque + atómico) |
+| `cross_entropy_sparse` (objetivos enteros) | ✔ | ✔ | reducción por filas; backward un elemento por fila |
+| `embedding` (gather de filas) | ✔ | ✔ | kernel de copia por fila; backward scatter-add atómico |
 | `sgd_step` / `optimizer_step` (Adam) | — | ✔ | kernel in-place; momentos m/v viven en device |
 | `zero_grad` | — | ✔ | memset en device (no baja ceros al host) |
 
 El resto (`conv2d`, pooling, `slice`, `concat`, otras reducciones) sigue
-en CPU en esta v3.
+en CPU en esta v3. `optimizer_set_lr` no es kernel: solo actualiza el lr
+del optimizador en host (permite warmup + decaimiento coseno).
 
 **Regla de residencia**: además del umbral de tamaño (16 384 elementos por
 defecto), una op va a GPU si su entrada ya reside en device — caer a CPU en
@@ -140,8 +143,17 @@ Máquina: NVIDIA RTX A2000 Laptop GPU (sm_86) bajo WSL2 Ubuntu, CUDA
 E5-2697 v3 (2014, 14c/28t, muy lenta en monohilo — contexto para no
 sobreestimar los factores).
 
-- **Suite**: 11/11 en build normal y 11/11 con `TC_CUDA_MIN_ELEMS=0`
-  (todas las rutas CUDA forzadas, validadas por diferencias finitas).
+- **Suite**: 12/12 en build normal y 12/12 con `TC_CUDA_MIN_ELEMS=0`
+  (todas las rutas CUDA forzadas, validadas por diferencias finitas;
+  incluye `tests/test_language_ops.c` para `embedding`,
+  `cross_entropy_sparse` y `optimizer_set_lr`).
+- **Code-LLM** (`examples/code_llm.py`, ~27.3M parámetros: dim 512, 6
+  bloques, 8 cabezas, seq 256, batch 16, vocab BPE 8192, corpus real de
+  Python + Bash de 24.8M tokens): entrena íntegro en GPU reanudando de
+  checkpoints (`tc.save`/`tc.load`). Corrida smoke de 300 pasos: loss
+  9.09 → 6.93 (ln(8192) ≈ 9.01 al inicio aleatorio), ~3.5 s/paso en
+  régimen — el cuello sigue siendo la latencia de lanzamiento WSL2, no
+  el cómputo.
 - **matmul 512×512 vía API de grafo** (`nd_matmul_bench.c`, media con
   warmup): CPU genérico 30.767 ms → GPU 0.914 ms en la v1 (sync por op),
   **0.339 ms con la v3 (sincronía diferida), ~91×**, checksum idéntico
@@ -172,8 +184,8 @@ Medido con micro-benchmarks sobre tensores ya residentes:
   que exige buffers estáticos: cambio de arquitectura mayor.
 
 Los pasos 3 (compute-sanitizer) y los benchmarks restantes del paso 4
-(`benchmark_vs_numpy.py`, CNN MNIST) quedan pendientes; la suite 11/11 y
-las dos mediciones de arriba son las que respaldan el estado "validado".
+(`benchmark_vs_numpy.py`, CNN MNIST) quedan pendientes; la suite 12/12 y
+las mediciones de arriba son las que respaldan el estado "validado".
 
 ## Limitaciones conocidas de la v3
 

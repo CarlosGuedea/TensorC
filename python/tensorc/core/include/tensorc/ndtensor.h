@@ -246,6 +246,20 @@ size_t tc_transformer_block_param_count(const tc_transformer_block *block);
 tc_tensor_nd *tc_transformer_block_param(tc_transformer_block *block,
                                          size_t index);
 
+/*
+ * Backend CUDA opcional (se compila con CMake -DTENSORC_USE_CUDA=ON).
+ * La API existe en todas las compilaciones: sin el backend,
+ * tc_cuda_available() devuelve 0 y tc_cuda_device() devuelve -1, así el
+ * código de usuario puede consultar sin #ifdef. Las operaciones con
+ * aceleración GPU se eligen automáticamente por tamaño dentro de cada op;
+ * no hay que mover tensores a mano. La variable de entorno
+ * TC_CUDA_MIN_ELEMS ajusta el umbral (0 fuerza GPU en todo, útil para
+ * validar las rutas CUDA con la suite de pruebas).
+ */
+int tc_cuda_available(void);
+int tc_cuda_set_device(int device); /* 1 si el dispositivo quedó activo */
+int tc_cuda_device(void);           /* índice activo o -1 sin backend */
+
 #ifdef __cplusplus
 }
 #endif

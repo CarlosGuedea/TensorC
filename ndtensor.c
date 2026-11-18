@@ -11,6 +11,11 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+#ifdef TENSORC_HAS_CUDA
+#include <limits.h>
+#include "tensorc_cuda_internal.h"
+#endif
+
 typedef enum {
     TC_ND_OP_LEAF = 0,
     TC_ND_OP_ADD,
@@ -56,6 +61,23 @@ struct tc_tensor_nd {
     /* Permutación de ejes para TC_ND_OP_PERMUTE (perm[i] = eje de la
      * entrada que va a la posición i de la salida). */
     size_t perm[8];
+#ifdef TENSORC_HAS_CUDA
+    /* Copias perezosas en GPU con flags de validez por copia. Invariante:
+     * al menos una copia (host o device) es válida en todo momento. Las
+     * rutas CUDA escriben en device y marcan la copia host como obsoleta;
+     * los accesores y los caminos genéricos sincronizan bajo demanda. */
+    float *dev_data;
+    float *dev_grad;
+    unsigned char host_data_valid;
+    unsigned char dev_data_valid;
+    unsigned char host_grad_valid;
+    unsigned char dev_grad_valid;
+    /* tc_tensor_nd_data() entrega un puntero host mutable: el llamador
+     * puede seguir escribiendo a través de él sin que lo veamos. Mientras
+     * esté expuesto, toda subida a device relee el host aunque la copia
+     * de device parezca válida. */
+    unsigned char host_data_exposed;
+#endif
 };
 
 static int checked_product(const size_t *shape, size_t ndim, size_t *result) {
@@ -93,6 +115,11 @@ static tc_tensor_nd *tensor_alloc(const size_t *shape, size_t ndim,
     tensor->refcount = 1;
     tensor->requires_grad = requires_grad != 0;
     tensor->op = TC_ND_OP_LEAF;
+#ifdef TENSORC_HAS_CUDA
+    /* calloc deja los punteros de device en NULL y sus flags en 0. */
+    tensor->host_data_valid = 1;
+    tensor->host_grad_valid = 1;
+#endif
     if (!tensor->shape || !tensor->strides || !tensor->data ||
         (requires_grad && !tensor->grad)) {
         free(tensor->shape);
@@ -135,8 +162,131 @@ void tc_tensor_nd_free(tc_tensor_nd *tensor) {
     free(tensor->strides);
     free(tensor->data);
     free(tensor->grad);
+#ifdef TENSORC_HAS_CUDA
+    tc__cuda_free(tensor->dev_data);
+    tc__cuda_free(tensor->dev_grad);
+#endif
     free(tensor);
 }
+
+#ifdef TENSORC_HAS_CUDA
+/*
+ * Sincronización perezosa host↔device. Convención:
+ *  - nd_cuda_host_*: garantiza que la copia host está al día (baja de
+ *    device solo si la marca host está obsoleta).
+ *  - nd_cuda_dev_*:  garantiza buffer de device con contenido al día
+ *    (sube de host solo si la marca device está obsoleta); 0 en fallo.
+ *  - nd_cuda_produced_*: marca que un kernel dejó la copia device al día.
+ * Cualquier fallo devuelve 0 y el llamador cae al camino genérico con el
+ * estado consistente (las copias host de las entradas nunca se invalidan
+ * antes de intentar la ruta CUDA).
+ */
+static void nd_cuda_host_data(const tc_tensor_nd *tensor) {
+    tc_tensor_nd *t = (tc_tensor_nd *)tensor;
+    if (!t || t->host_data_valid) return;
+    if (t->dev_data &&
+        tc__cuda_copy_d2h(t->data, t->dev_data, t->size)) {
+        t->host_data_valid = 1;
+        return;
+    }
+    /* Fallo de copia = dispositivo muerto: la copia host quedaría con
+     * basura y cualquier resultado posterior sería incorrecto en
+     * silencio. Se aborta con diagnóstico (misma política que en el
+     * backward de matmul). */
+    fprintf(stderr, "TensorC CUDA: no se pudo bajar data al host; "
+                    "el estado del dispositivo es irrecuperable.\n");
+    abort();
+}
+
+static void nd_cuda_host_grad(const tc_tensor_nd *tensor) {
+    tc_tensor_nd *t = (tc_tensor_nd *)tensor;
+    if (!t || !t->grad || t->host_grad_valid) return;
+    if (t->dev_grad &&
+        tc__cuda_copy_d2h(t->grad, t->dev_grad, t->size)) {
+        t->host_grad_valid = 1;
+        return;
+    }
+    fprintf(stderr, "TensorC CUDA: no se pudo bajar grad al host; "
+                    "el estado del dispositivo es irrecuperable.\n");
+    abort();
+}
+
+static int nd_cuda_dev_data(tc_tensor_nd *tensor) {
+    if (tensor->dev_data_valid && !tensor->host_data_exposed) return 1;
+    if (!tensor->dev_data) {
+        tensor->dev_data = tc__cuda_alloc(tensor->size);
+        if (!tensor->dev_data) return 0;
+    }
+    if (tensor->host_data_valid &&
+        !tc__cuda_copy_h2d(tensor->dev_data, tensor->data, tensor->size))
+        return 0;
+    tensor->dev_data_valid = 1;
+    return 1;
+}
+
+static int nd_cuda_dev_grad(tc_tensor_nd *tensor) {
+    if (!tensor->grad) return 0;
+    if (tensor->dev_grad_valid) return 1;
+    if (!tensor->dev_grad) {
+        tensor->dev_grad = tc__cuda_alloc(tensor->size);
+        if (!tensor->dev_grad) return 0;
+    }
+    if (tensor->host_grad_valid &&
+        !tc__cuda_copy_h2d(tensor->dev_grad, tensor->grad, tensor->size))
+        return 0;
+    tensor->dev_grad_valid = 1;
+    return 1;
+}
+
+/* Solo reserva el buffer de salida: el kernel sobrescribe cada elemento. */
+static int nd_cuda_dev_alloc_data(tc_tensor_nd *tensor) {
+    if (!tensor->dev_data) {
+        tensor->dev_data = tc__cuda_alloc(tensor->size);
+        if (!tensor->dev_data) return 0;
+    }
+    return 1;
+}
+
+static void nd_cuda_produced_data(tc_tensor_nd *tensor) {
+    tensor->dev_data_valid = 1;
+    tensor->host_data_valid = 0;
+}
+
+static void nd_cuda_produced_grad(tc_tensor_nd *tensor) {
+    tensor->dev_grad_valid = 1;
+    tensor->host_grad_valid = 0;
+}
+
+/* Descriptor de broadcasting para los kernels (límite TC_CUDA_MAX_DIMS). */
+static int nd_cuda_broadcast_desc(const tc_tensor_nd *a, const tc_tensor_nd *b,
+                                  const tc_tensor_nd *out,
+                                  tc_cuda_broadcast_desc *desc) {
+    if (a->ndim > TC_CUDA_MAX_DIMS || b->ndim > TC_CUDA_MAX_DIMS ||
+        out->ndim > TC_CUDA_MAX_DIMS)
+        return 0;
+    memset(desc, 0, sizeof(*desc));
+    desc->ndim = (int)out->ndim;
+    desc->a_ndim = (int)a->ndim;
+    desc->b_ndim = (int)b->ndim;
+    for (size_t i = 0; i < out->ndim; ++i) {
+        desc->out_shape[i] = out->shape[i];
+        desc->out_strides[i] = out->strides[i];
+    }
+    for (size_t i = 0; i < a->ndim; ++i) {
+        desc->a_shape[i] = a->shape[i];
+        desc->a_strides[i] = a->strides[i];
+    }
+    for (size_t i = 0; i < b->ndim; ++i) {
+        desc->b_shape[i] = b->shape[i];
+        desc->b_strides[i] = b->strides[i];
+    }
+    return 1;
+}
+
+#define ND_SYNC_DATA(t) nd_cuda_host_data(t)
+#else
+#define ND_SYNC_DATA(t) ((void)0)
+#endif
 
 size_t tc_tensor_nd_numel(const tc_tensor_nd *tensor) {
     return tensor ? tensor->size : 0;
@@ -151,15 +301,32 @@ const size_t *tc_tensor_nd_shape(const tc_tensor_nd *tensor) {
 }
 
 float *tc_tensor_nd_data(tc_tensor_nd *tensor) {
-    return tensor ? tensor->data : NULL;
+    if (!tensor) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    nd_cuda_host_data(tensor);
+    /* Puntero mutable: el llamador puede escribir ahora y DESPUÉS a través
+     * del mismo puntero. La copia de device queda obsoleta y marcada como
+     * expuesta: cada subida posterior relee el host por seguridad. */
+    tensor->dev_data_valid = 0;
+    tensor->host_data_exposed = 1;
+#endif
+    return tensor->data;
 }
 
 const float *tc_tensor_nd_const_data(const tc_tensor_nd *tensor) {
-    return tensor ? tensor->data : NULL;
+    if (!tensor) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    nd_cuda_host_data(tensor);
+#endif
+    return tensor->data;
 }
 
 const float *tc_tensor_nd_grad(const tc_tensor_nd *tensor) {
-    return tensor ? tensor->grad : NULL;
+    if (!tensor) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    nd_cuda_host_grad(tensor);
+#endif
+    return tensor->grad;
 }
 
 int tc_tensor_nd_requires_grad(const tc_tensor_nd *tensor) {
@@ -167,14 +334,25 @@ int tc_tensor_nd_requires_grad(const tc_tensor_nd *tensor) {
 }
 
 void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor) {
-    if (tensor && tensor->grad) memset(tensor->grad, 0, tensor->size * sizeof(float));
+    if (tensor && tensor->grad) {
+        memset(tensor->grad, 0, tensor->size * sizeof(float));
+#ifdef TENSORC_HAS_CUDA
+        tensor->host_grad_valid = 1;
+        tensor->dev_grad_valid = 0;
+#endif
+    }
 }
 
 int tc_tensor_nd_copy_(tc_tensor_nd *dst, const tc_tensor_nd *src) {
     if (!dst || !src || dst->ndim != src->ndim) return 0;
     for (size_t i = 0; i < dst->ndim; ++i)
         if (dst->shape[i] != src->shape[i]) return 0;
+    ND_SYNC_DATA(src);
     memcpy(dst->data, src->data, src->size * sizeof(float));
+#ifdef TENSORC_HAS_CUDA
+    dst->host_data_valid = 1;
+    dst->dev_data_valid = 0;
+#endif
     return 1;
 }
 
@@ -323,6 +501,22 @@ tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && result->size >= tc__cuda_min_elems()) {
+        tc_cuda_broadcast_desc desc;
+        if (nd_cuda_broadcast_desc(a, b, result, &desc) &&
+            nd_cuda_dev_data((tc_tensor_nd *)a) &&
+            nd_cuda_dev_data((tc_tensor_nd *)b) &&
+            nd_cuda_dev_alloc_data(result) &&
+            tc__cuda_add_forward(a->dev_data, b->dev_data, result->dev_data,
+                                 result->size, &desc)) {
+            nd_cuda_produced_data(result);
+            return result;
+        }
+    }
+#endif
+    ND_SYNC_DATA(a);
+    ND_SYNC_DATA(b);
     size_t cols = 0;
     if (is_row_broadcast(a, b, result, &cols)) {
         row_broadcast_binary(a, b, result, 0);
@@ -348,6 +542,22 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && result->size >= tc__cuda_min_elems()) {
+        tc_cuda_broadcast_desc desc;
+        if (nd_cuda_broadcast_desc(a, b, result, &desc) &&
+            nd_cuda_dev_data((tc_tensor_nd *)a) &&
+            nd_cuda_dev_data((tc_tensor_nd *)b) &&
+            nd_cuda_dev_alloc_data(result) &&
+            tc__cuda_mul_forward(a->dev_data, b->dev_data, result->dev_data,
+                                 result->size, &desc)) {
+            nd_cuda_produced_data(result);
+            return result;
+        }
+    }
+#endif
+    ND_SYNC_DATA(a);
+    ND_SYNC_DATA(b);
     size_t cols = 0;
     if (is_row_broadcast(a, b, result, &cols)) {
         row_broadcast_binary(a, b, result, 1);
@@ -371,6 +581,28 @@ tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) 
     tc_tensor_nd *result = binary_result(shape, 2, TC_ND_OP_MATMUL,
                                             a, b);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    /* Ruta rápida GPU: cuBLAS con el mismo criterio de tamaño que
+     * Accelerate. El resultado queda residente en device. */
+    {
+        const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
+        if (tc_cuda_available() &&
+            m <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
+            n <= (size_t)INT_MAX && m > 0 && k > 0 && n > 0 &&
+            m <= ((size_t)-1) / n && k <= ((size_t)-1) / n &&
+            m * n * k >= tc__cuda_min_gemm_work() &&
+            nd_cuda_dev_data((tc_tensor_nd *)a) &&
+            nd_cuda_dev_data((tc_tensor_nd *)b) &&
+            nd_cuda_dev_alloc_data(result) &&
+            tc__cuda_matmul_nn(a->dev_data, b->dev_data, result->dev_data,
+                               m, k, n)) {
+            nd_cuda_produced_data(result);
+            return result;
+        }
+    }
+#endif
+    ND_SYNC_DATA(a);
+    ND_SYNC_DATA(b);
 #ifdef TENSORC_HAS_ACCELERATE
     /* Ruta rápida: GEMM de Accelerate para tamaños donde el triple loop
      * escalar ya se nota. El producto m*n*k acota el trabajo. */
@@ -558,9 +790,13 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
     result->conv_options = options;
 
 #ifdef TENSORC_HAS_ACCELERATE
+    ND_SYNC_DATA(input);
+    ND_SYNC_DATA(kernel);
     if (conv2d_accelerate_forward(input, kernel, options, result))
         return result;
 #endif
+    ND_SYNC_DATA(input);
+    ND_SYNC_DATA(kernel);
     conv2d_forward_naive(input, kernel, options, result);
     return result;
 }
@@ -570,6 +806,17 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(input->shape, input->ndim, TC_ND_OP_RELU,
                                             input);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && input->size >= tc__cuda_min_elems() &&
+        nd_cuda_dev_data((tc_tensor_nd *)input) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_relu_forward(input->dev_data, result->dev_data,
+                              input->size)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(input);
     for (size_t i = 0; i < input->size; ++i)
         result->data[i] = input->data[i] > 0.0f ? input->data[i] : 0.0f;
     return result;
@@ -581,6 +828,17 @@ tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input) {
                                             TC_ND_OP_SIGMOID,
                                             input);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && input->size >= tc__cuda_min_elems() &&
+        nd_cuda_dev_data((tc_tensor_nd *)input) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_sigmoid_forward(input->dev_data, result->dev_data,
+                                 input->size)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(input);
     for (size_t i = 0; i < input->size; ++i) {
         /* Rama estable según el signo: evita exp() de argumento positivo. */
         const float x = input->data[i];
@@ -597,6 +855,17 @@ tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input) {
                                             TC_ND_OP_TANH,
                                             input);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && input->size >= tc__cuda_min_elems() &&
+        nd_cuda_dev_data((tc_tensor_nd *)input) &&
+        nd_cuda_dev_alloc_data(result) &&
+        tc__cuda_tanh_forward(input->dev_data, result->dev_data,
+                              input->size)) {
+        nd_cuda_produced_data(result);
+        return result;
+    }
+#endif
+    ND_SYNC_DATA(input);
     for (size_t i = 0; i < input->size; ++i)
         result->data[i] = tanhf(input->data[i]);
     return result;
@@ -609,6 +878,20 @@ tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input) {
                                             TC_ND_OP_SOFTMAX,
                                             input);
     if (!result) return NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (tc_cuda_available() && input->size >= tc__cuda_min_elems()) {
+        const size_t classes_ = input->shape[input->ndim - 1];
+        const size_t rows_ = input->size / classes_;
+        if (nd_cuda_dev_data((tc_tensor_nd *)input) &&
+            nd_cuda_dev_alloc_data(result) &&
+            tc__cuda_softmax_forward(input->dev_data, result->dev_data,
+                                     rows_, classes_)) {
+            nd_cuda_produced_data(result);
+            return result;
+        }
+    }
+#endif
+    ND_SYNC_DATA(input);
     const size_t classes = input->shape[input->ndim - 1];
     const size_t rows = input->size / classes;
     for (size_t r = 0; r < rows; ++r) {
@@ -640,6 +923,8 @@ tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
                                             prediction,
                                             target);
     if (!result) return NULL;
+    ND_SYNC_DATA(prediction);
+    ND_SYNC_DATA(target);
     for (size_t r = 0; r < rows; ++r)
         for (size_t j = 0; j < classes; ++j) {
             const float p = prediction->data[r * classes + j];
@@ -658,6 +943,7 @@ tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
     tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_RESHAPE,
                                             input);
     if (!result) return NULL;
+    ND_SYNC_DATA(input);
     memcpy(result->data, input->data, input->size * sizeof(float));
     return result;
 }
@@ -675,6 +961,7 @@ tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
                                             input);
     if (!result) return NULL;
 
+    ND_SYNC_DATA(input);
     const size_t batch = input->shape[0];
     const size_t channels = input->shape[1];
     const size_t input_height = input->shape[2];
@@ -714,6 +1001,7 @@ tc_tensor_nd *tc_tensor_nd_avgpool2d(const tc_tensor_nd *input,
                                             input);
     if (!result) return NULL;
 
+    ND_SYNC_DATA(input);
     const size_t batch = input->shape[0];
     const size_t channels = input->shape[1];
     const size_t input_height = input->shape[2];
@@ -745,6 +1033,7 @@ tc_tensor_nd *tc_tensor_nd_sum(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(shape, 1, TC_ND_OP_SUM,
                                             input);
     if (!result) return NULL;
+    ND_SYNC_DATA(input);
     for (size_t i = 0; i < input->size; ++i) result->data[0] += input->data[i];
     return result;
 }
@@ -757,6 +1046,8 @@ tc_tensor_nd *tc_tensor_nd_mse_loss(const tc_tensor_nd *prediction,
                                             prediction,
                                             target);
     if (!result) return NULL;
+    ND_SYNC_DATA(prediction);
+    ND_SYNC_DATA(target);
     for (size_t i = 0; i < prediction->size; ++i) {
         const float error = prediction->data[i] - target->data[i];
         result->data[0] += error * error;
@@ -782,6 +1073,7 @@ tc_tensor_nd *tc_tensor_nd_slice_axis(const tc_tensor_nd *input, size_t axis,
     if (!result) return NULL;
     result->slice_axis = axis;
     result->slice_start = start;
+    ND_SYNC_DATA(input);
     const size_t inner = input->strides[axis];
     const size_t outer = input->size / (input->shape[axis] * inner);
     const size_t block = length * inner;
@@ -806,6 +1098,7 @@ tc_tensor_nd *tc_tensor_nd_concat(const tc_tensor_nd *const *inputs,
         tc_tensor_nd *result =
             unary_result(inputs[0]->shape, inputs[0]->ndim, TC_ND_OP_RESHAPE,
                          inputs[0]);
+        ND_SYNC_DATA(inputs[0]);
         if (result) memcpy(result->data, inputs[0]->data,
                            inputs[0]->size * sizeof(float));
         return result;
@@ -832,6 +1125,7 @@ tc_tensor_nd *tc_tensor_nd_concat(const tc_tensor_nd *const *inputs,
     if (!result) return NULL;
 
     /* Copia bloque a bloque: cada tensor aporta su tramo del eje. */
+    for (size_t i = 0; i < count; ++i) ND_SYNC_DATA(inputs[i]);
     const size_t inner = inputs[0]->strides[axis];
     const size_t outer = inputs[0]->size / (inputs[0]->shape[axis] * inner);
     size_t axis_offset = 0;
@@ -859,6 +1153,7 @@ tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                         TC_ND_OP_LAYERNORM, input);
     if (!result) return NULL;
+    ND_SYNC_DATA(input);
     for (size_t r = 0; r < rows; ++r) {
         const float *src = input->data + r * width;
         float *dst = result->data + r * width;
@@ -886,6 +1181,7 @@ tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input) {
     const size_t shape[] = {input->shape[1], input->shape[0]};
     tc_tensor_nd *result = unary_result(shape, 2, TC_ND_OP_TRANSPOSE, input);
     if (!result) return NULL;
+    ND_SYNC_DATA(input);
     for (size_t i = 0; i < input->shape[0]; ++i)
         for (size_t j = 0; j < input->shape[1]; ++j)
             result->data[j * input->shape[0] + i] = input->data[i * input->shape[1] + j];
@@ -911,6 +1207,7 @@ tc_tensor_nd *tc_tensor_nd_permute(const tc_tensor_nd *input,
     tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_PERMUTE, input);
     if (!result) return NULL;
     for (size_t i = 0; i < ndim; ++i) result->perm[i] = axes[i];
+    ND_SYNC_DATA(input);
     /* Recorrido lineal de la entrada: cada índice lineal se descompone en
      * índices multidimensionales y se reensambla en la posición de salida
      * usando la permutación. */
@@ -958,6 +1255,9 @@ tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
     const size_t depth = query->shape[2];
     const size_t v_depth = value->shape[2];
     const float scale = 1.0f / sqrtf((float)depth);
+    ND_SYNC_DATA(query);
+    ND_SYNC_DATA(key);
+    ND_SYNC_DATA(value);
     float *scores = (float *)malloc(q_seq * k_seq * sizeof(float));
     if (!scores) {
         tc_tensor_nd_free(result);
@@ -1131,14 +1431,190 @@ static int build_topology(tc_tensor_nd *tensor, tensor_list *list) {
 }
 
 static void add_grad(tc_tensor_nd *tensor, size_t index, float value) {
-    if (tensor && tensor->requires_grad && tensor->grad)
+    if (tensor && tensor->requires_grad && tensor->grad) {
+#ifdef TENSORC_HAS_CUDA
+        /* El backward genérico escribe en host: sincroniza e invalida la
+         * copia de device. */
+        nd_cuda_host_grad(tensor);
+        tensor->dev_grad_valid = 0;
+#endif
         tensor->grad[index] += value;
+    }
 }
+
+#ifdef TENSORC_HAS_CUDA
+/*
+ * Dispatcher del backward en GPU. Devuelve 1 si procesó el nodo por
+ * completo; 0 pide el camino genérico (ndtensor.c sincroniza a host antes
+ * de caer). Las pruebas previas (disponibilidad, tamaños, buffers) se
+ * hacen antes de lanzar trabajo; los kernels se verifican con sincronía
+ * inmediata, de modo que cada op es todo-o-nada. En el backward de matmul
+ * hay dos GEMM encadenados que acumulan: si el segundo fallara tras
+ * completarse el primero el estado sería irrecuperable, así que se aborta
+ * con diagnóstico (fallo de driver/hardware; la alternativa sería
+ * devolver gradientes corruptos en silencio).
+ */
+static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
+                                 tc_tensor_nd *b) {
+    if (!tc_cuda_available() || !tensor->grad) return 0;
+    switch (tensor->op) {
+        case TC_ND_OP_MATMUL: {
+            const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
+            if (m == 0 || k == 0 || n == 0 || m > (size_t)INT_MAX ||
+                k > (size_t)INT_MAX || n > (size_t)INT_MAX ||
+                m > ((size_t)-1) / n || k > ((size_t)-1) / n ||
+                m * n * k < tc__cuda_min_gemm_work())
+                return 0;
+            const int want_a = a->requires_grad && a->grad;
+            const int want_b = b->requires_grad && b->grad;
+            if (!want_a && !want_b) return 1;
+            if (!nd_cuda_dev_grad(tensor)) return 0;
+            if (want_a &&
+                (!nd_cuda_dev_data(b) || !nd_cuda_dev_grad(a)))
+                return 0;
+            if (want_b &&
+                (!nd_cuda_dev_data(a) || !nd_cuda_dev_grad(b)))
+                return 0;
+            if (want_a) {
+                if (!tc__cuda_matmul_nt(tensor->dev_grad, b->dev_data,
+                                        a->dev_grad, m, k, n))
+                    return 0;
+                nd_cuda_produced_grad(a);
+            }
+            if (want_b) {
+                if (!tc__cuda_matmul_tn(a->dev_data, tensor->dev_grad,
+                                        b->dev_grad, m, k, n)) {
+                    if (want_a) {
+                        fprintf(stderr,
+                                "TensorC CUDA: la segunda GEMM del backward "
+                                "falló tras acumular dA; gradientes "
+                                "irrecuperables.\n");
+                        abort();
+                    }
+                    return 0;
+                }
+                nd_cuda_produced_grad(b);
+            }
+            return 1;
+        }
+        case TC_ND_OP_ADD: {
+            if (tensor->size < tc__cuda_min_elems()) return 0;
+            tc_cuda_broadcast_desc desc;
+            if (!nd_cuda_broadcast_desc(a, b, tensor, &desc)) return 0;
+            const int want_a = a->requires_grad && a->grad;
+            const int want_b = b->requires_grad && b->grad;
+            if (!want_a && !want_b) return 1;
+            if (!nd_cuda_dev_grad(tensor)) return 0;
+            if (want_a && !nd_cuda_dev_grad(a)) return 0;
+            if (want_b && !nd_cuda_dev_grad(b)) return 0;
+            if (!tc__cuda_add_backward(tensor->dev_grad,
+                                       want_a ? a->dev_grad : NULL,
+                                       want_b ? b->dev_grad : NULL,
+                                       tensor->size, &desc, want_a, want_b))
+                return 0;
+            if (want_a) nd_cuda_produced_grad(a);
+            if (want_b) nd_cuda_produced_grad(b);
+            return 1;
+        }
+        case TC_ND_OP_MUL: {
+            if (tensor->size < tc__cuda_min_elems()) return 0;
+            tc_cuda_broadcast_desc desc;
+            if (!nd_cuda_broadcast_desc(a, b, tensor, &desc)) return 0;
+            const int want_a = a->requires_grad && a->grad;
+            const int want_b = b->requires_grad && b->grad;
+            if (!want_a && !want_b) return 1;
+            if (!nd_cuda_dev_grad(tensor)) return 0;
+            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b)) return 0;
+            if (want_a && !nd_cuda_dev_grad(a)) return 0;
+            if (want_b && !nd_cuda_dev_grad(b)) return 0;
+            if (!tc__cuda_mul_backward(tensor->dev_grad, a->dev_data,
+                                       b->dev_data,
+                                       want_a ? a->dev_grad : NULL,
+                                       want_b ? b->dev_grad : NULL,
+                                       tensor->size, &desc, want_a, want_b))
+                return 0;
+            if (want_a) nd_cuda_produced_grad(a);
+            if (want_b) nd_cuda_produced_grad(b);
+            return 1;
+        }
+        case TC_ND_OP_RELU: {
+            if (a->size < tc__cuda_min_elems() ||
+                !a->requires_grad || !a->grad)
+                return 0;
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(a) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_relu_backward(a->dev_data, tensor->dev_grad,
+                                        a->dev_grad, a->size))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        case TC_ND_OP_SIGMOID: {
+            if (a->size < tc__cuda_min_elems() ||
+                !a->requires_grad || !a->grad)
+                return 0;
+            /* El backward usa la salida y = sigmoid(x), que es tensor. */
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_sigmoid_backward(tensor->dev_data,
+                                           tensor->dev_grad, a->dev_grad,
+                                           a->size))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        case TC_ND_OP_TANH: {
+            if (a->size < tc__cuda_min_elems() ||
+                !a->requires_grad || !a->grad)
+                return 0;
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_tanh_backward(tensor->dev_data, tensor->dev_grad,
+                                        a->dev_grad, a->size))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        case TC_ND_OP_SOFTMAX: {
+            if (a->size < tc__cuda_min_elems() ||
+                !a->requires_grad || !a->grad)
+                return 0;
+            const size_t classes = a->shape[a->ndim - 1];
+            const size_t rows = a->size / classes;
+            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
+                !nd_cuda_dev_grad(a))
+                return 0;
+            if (!tc__cuda_softmax_backward(tensor->dev_data,
+                                           tensor->dev_grad, a->dev_grad,
+                                           rows, classes))
+                return 0;
+            nd_cuda_produced_grad(a);
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+#endif
 
 static void backward_node(tc_tensor_nd *tensor) {
     if (!tensor || !tensor->requires_grad || !tensor->grad) return;
     tc_tensor_nd *a = tensor->parent_count > 0 ? tensor->parents[0] : NULL;
     tc_tensor_nd *b = tensor->parent_count > 1 ? tensor->parents[1] : NULL;
+#ifdef TENSORC_HAS_CUDA
+    if (nd_cuda_backward_node(tensor, a, b)) return;
+    /* Camino genérico: todas las copias que el switch lee o escribe deben
+     * estar al día en host (data y grad del nodo y de cada padre). */
+    nd_cuda_host_grad(tensor);
+    nd_cuda_host_data(tensor);
+    for (size_t p = 0; p < tensor->parent_count; ++p) {
+        nd_cuda_host_data(tensor->parents[p]);
+        nd_cuda_host_grad(tensor->parents[p]);
+    }
+#endif
     switch (tensor->op) {
         case TC_ND_OP_ADD: {
             size_t cols = 0;
@@ -1633,6 +2109,13 @@ static void backward_node(tc_tensor_nd *tensor) {
         default:
             break;
     }
+#ifdef TENSORC_HAS_CUDA
+    /* El backward genérico acumuló gradientes en host (la atención escribe
+     * q/k/v->grad directamente, sin pasar por add_grad): las copias de
+     * device de los padres quedan obsoletas. */
+    for (size_t p = 0; p < tensor->parent_count; ++p)
+        tensor->parents[p]->dev_grad_valid = 0;
+#endif
 }
 
 int tc_tensor_nd_backward(tc_tensor_nd *loss) {
@@ -1655,6 +2138,7 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name) {
         printf("%s: <tensor inválido>\n", name ? name : "tensor");
         return;
     }
+    ND_SYNC_DATA(tensor);
     printf("%s shape=[", name ? name : "tensor");
     for (size_t i = 0; i < tensor->ndim; ++i)
         printf("%s%zu", i ? ", " : "", tensor->shape[i]);
@@ -1665,8 +2149,15 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name) {
 
 void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate) {
     if (!param || !param->grad) return;
+#ifdef TENSORC_HAS_CUDA
+    nd_cuda_host_data(param);
+    nd_cuda_host_grad(param);
+#endif
     for (size_t i = 0; i < param->size; ++i)
         param->data[i] -= learning_rate * param->grad[i];
+#ifdef TENSORC_HAS_CUDA
+    param->dev_data_valid = 0;
+#endif
 }
 
 /* Generador xorshift32 determinista para la inicialización de capas. */
@@ -1851,6 +2342,10 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
         if (!param || !param->grad) continue;
         float *m = optimizer->m[i];
         float *v = optimizer->v[i];
+#ifdef TENSORC_HAS_CUDA
+        nd_cuda_host_data(param);
+        nd_cuda_host_grad(param);
+#endif
         for (size_t j = 0; j < param->size; ++j) {
             const float grad = param->grad[j];
             m[j] = beta1 * m[j] + (1.0f - beta1) * grad;
@@ -1860,6 +2355,9 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
             param->data[j] -=
                 optimizer->learning_rate * m_hat / (sqrtf(v_hat) + epsilon);
         }
+#ifdef TENSORC_HAS_CUDA
+        param->dev_data_valid = 0;
+#endif
         ++updated;
     }
     return updated;
@@ -2361,6 +2859,7 @@ static int read_u64(FILE *file, uint64_t *value) {
 }
 
 static int write_tensor_payload(FILE *file, const tc_tensor_nd *tensor) {
+    ND_SYNC_DATA(tensor);
     if (!write_u64(file, (uint64_t)tensor->ndim)) return 0;
     for (size_t i = 0; i < tensor->ndim; ++i)
         if (!write_u64(file, (uint64_t)tensor->shape[i])) return 0;
@@ -2473,3 +2972,12 @@ void tc_free_checkpoint(tc_tensor_nd **tensors, size_t count) {
         tc_tensor_nd_free(tensors[i]);
     free(tensors);
 }
+
+#ifndef TENSORC_HAS_CUDA
+/* Stubs de la API pública CUDA cuando la biblioteca se compila sin el
+ * backend: la API existe siempre y reporta "no disponible". Con
+ * TENSORC_HAS_CUDA las implementaciones viven en tensorc_cuda.cu. */
+int tc_cuda_available(void) { return 0; }
+int tc_cuda_set_device(int device) { (void)device; return 0; }
+int tc_cuda_device(void) { return -1; }
+#endif

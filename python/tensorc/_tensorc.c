@@ -759,6 +759,26 @@ static PyObject *module_load(PyObject *self, PyObject *args,
 /* Definida más abajo; declaración anticipada para la tabla de métodos. */
 static PyObject *module_sinusoidal_positions(PyObject *self, PyObject *args);
 
+/* Backend CUDA: consulta sin #ifdef; sin el backend devuelven False/-1. */
+static PyObject *module_cuda_available(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyBool_FromLong(tc_cuda_available());
+}
+
+static PyObject *module_cuda_set_device(PyObject *self, PyObject *args) {
+    int device;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
+    return PyBool_FromLong(tc_cuda_set_device(device));
+}
+
+static PyObject *module_cuda_device(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(tc_cuda_device());
+}
+
 static PyMethodDef module_methods[] = {
     {"sinusoidal_positions", (PyCFunction)module_sinusoidal_positions,
      METH_VARARGS,
@@ -767,6 +787,12 @@ static PyMethodDef module_methods[] = {
      "save(tensor_o_lista, path) -> guarda un checkpoint binario."},
     {"load", (PyCFunction)module_load, METH_VARARGS | METH_KEYWORDS,
      "load(path, requires_grad=False) -> Tensor o lista de Tensors."},
+    {"cuda_available", (PyCFunction)module_cuda_available, METH_NOARGS,
+     "cuda_available() -> True si el paquete se compiló con backend CUDA y hay GPU."},
+    {"cuda_set_device", (PyCFunction)module_cuda_set_device, METH_VARARGS,
+     "cuda_set_device(i) -> True si el dispositivo i quedó activo."},
+    {"cuda_device", (PyCFunction)module_cuda_device, METH_NOARGS,
+     "cuda_device() -> índice del dispositivo activo o -1 sin backend."},
     {NULL, NULL, 0, NULL}
 };
 

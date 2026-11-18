@@ -4,6 +4,7 @@ project(TensorC VERSION 0.14.0 LANGUAGES C)
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
 option(TENSORC_USE_ACCELERATE "Use Apple Accelerate for large matrix operations" ON)
+option(TENSORC_USE_CUDA "Use NVIDIA CUDA backend for large tensor operations" OFF)
 
 add_library(tensorc minitf.c ndtensor.c)
 add_library(TensorC::tensorc ALIAS tensorc)
@@ -28,6 +29,18 @@ if(APPLE AND TENSORC_USE_ACCELERATE)
     else()
         message(WARNING "Apple Accelerate no está disponible; se usará el backend genérico.")
     endif()
+endif()
+if(TENSORC_USE_CUDA)
+    # Tercer backend tras el mismo switch: ndtensor.c elige por tamaño y
+    # cae al camino genérico ante cualquier fallo. Requiere CUDA Toolkit
+    # (nvcc) y CMake >= 3.18 para find_package(CUDAToolkit).
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(tensorc PRIVATE tensorc_cuda.cu)
+    target_compile_definitions(tensorc PRIVATE TENSORC_HAS_CUDA=1)
+    target_link_libraries(tensorc PUBLIC CUDA::cudart CUDA::cublas)
+    set_target_properties(tensorc PROPERTIES CUDA_STANDARD 14 CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "TensorC: backend CUDA activado (TENSORC_HAS_CUDA).")
 endif()
 set_target_properties(tensorc PROPERTIES
     VERSION ${PROJECT_VERSION}

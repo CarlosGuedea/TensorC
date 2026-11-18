@@ -1,5 +1,6 @@
 # The vendored C core must ship inside the sdist so the wheel can be
-# built from it on any machine (pip builds wheels from the sdist).
-recursive-include tensorc/core *.c *.h
+# built from it on any machine (pip builds wheels from the sdist). The
+# .cu is the optional CUDA backend (TENSORC_CUDA=1 local builds).
+recursive-include tensorc/core *.c *.h *.cu
 include README.md
 include sync_core.sh

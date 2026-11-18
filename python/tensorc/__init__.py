@@ -12,6 +12,9 @@ from ._tensorc import (
     LSTMLayer,
     Tensor,
     TransformerBlock,
+    cuda_available,
+    cuda_device,
+    cuda_set_device,
     load,
     save,
     sinusoidal_positions,
@@ -31,5 +34,8 @@ __all__ = [
     "load",
     "save",
     "sinusoidal_positions",
+    "cuda_available",
+    "cuda_device",
+    "cuda_set_device",
     "__version__",
 ]

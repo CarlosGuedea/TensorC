@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TensorC VERSION 0.14.0 LANGUAGES C)
+project(TensorC VERSION 0.15.0 LANGUAGES C)
 
 option(TENSORC_BUILD_EXAMPLES "Build TensorC examples" ON)
 option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
@@ -61,6 +61,8 @@ if(TENSORC_BUILD_EXAMPLES)
     target_link_libraries(tensorc_matmul_benchmark PRIVATE TensorC::tensorc)
     add_executable(tensorc_cnn_mnist examples/cnn_mnist.c)
     target_link_libraries(tensorc_cnn_mnist PRIVATE TensorC::tensorc)
+    add_executable(tensorc_study_classifier examples/study_classifier.c)
+    target_link_libraries(tensorc_study_classifier PRIVATE TensorC::tensorc)
 endif()
 
 if(TENSORC_BUILD_BENCHMARKS)

@@ -20,8 +20,9 @@ from ._tensorc import (
     sinusoidal_positions,
 )
 from .model import Model
+from .sklearn import TensorCClassifier
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 __all__ = [
     "Tensor",
@@ -31,6 +32,7 @@ __all__ = [
     "TransformerBlock",
     "Adam",
     "Model",
+    "TensorCClassifier",
     "load",
     "save",
     "sinusoidal_positions",

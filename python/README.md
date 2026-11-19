@@ -125,6 +125,33 @@ model.save_weights("modelo.tck")   # checkpoint binario
 model2.load_weights("modelo.tck")  # valida formas y copia los pesos
 ```
 
+### Clasificador estilo scikit-learn
+
+`TensorCClassifier` recibe arrays NumPy y conserva el cálculo de la red,
+autograd y Adam en TensorC:
+
+```python
+import numpy as np
+import tensorc
+
+layer = tensorc.DenseLayer(4, 2, seed=7)
+clf = tensorc.TensorCClassifier(
+    forward=lambda x: layer.forward(x),
+    params=[layer.weight, layer.bias],
+    epochs=100,
+    batch_size=32,
+    learning_rate=0.001,
+)
+clf.fit(X_train, y_train)
+predicciones = clf.predict(X_test)
+probabilidades = clf.predict_proba(X_test)
+exactitud = clf.score(X_test, y_test)
+clf.save("clasificador.tck")
+```
+
+La interfaz incluye `fit`, `predict`, `predict_proba`, `score`, `get_params`,
+`set_params`, `save` y `load_weights`.
+
 ### Guardar y cargar tensores
 
 ```python
@@ -195,7 +222,7 @@ rueda y publica todo en PyPI automáticamente. Para publicar una versión:
 #    python/pyproject.toml y python/tensorc/__init__.py
 # 2. Ejecuta bash python/sync_core.sh tras cambiar el núcleo C
 # 3. Etiqueta y sube:
-git tag v0.14.0 && git push origin v0.14.0
+git tag v0.15.0 && git push origin v0.15.0
 ```
 
 Para subir a mano (necesitas un token de PyPI):

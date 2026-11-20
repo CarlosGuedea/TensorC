@@ -1,8 +1,11 @@
 # TensorC
 
-TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API compatible de tensores 2D y modelos densos, además de una API experimental de tensores N-dimensionales con autodiferenciación en CPU. No requiere Python ni dependencias de terceros.
+> Guía detallada de instalación, Python, C11, CNN, MNIST, el wrapper estilo
+> scikit-learn y solución de errores: [GUIA_USO.md](GUIA_USO.md).
 
-La versión 0.9 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencia, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, softmax, suma, pérdida MSE y cross-entropy, además de una capa convolucional de alto nivel con inicialización Xavier, pasos SGD y optimizador Adam. También permite guardar y cargar modelos densos con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación de modelos de TensorFlow.
+TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API de tensores N-dimensionales con autodiferenciación en CPU. La versión actual es 0.15.0 y se puede instalar desde Python con pip install tensorc.
+
+La versión 0.15.0 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencia, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, softmax, suma, pérdida MSE y cross-entropy, además de capas densas y convolucionales con inicialización Xavier y optimizador Adam. También permite guardar y cargar checkpoints con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación directa de modelos de TensorFlow.
 
 ## Compilar
 

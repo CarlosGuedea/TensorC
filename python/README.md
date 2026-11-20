@@ -1,5 +1,9 @@
 # tensorc
 
+Consulta la [guía detallada de uso](../GUIA_USO.md) para instalación,
+entrenamiento, CNN, MNIST, C11, el wrapper estilo scikit-learn y solución de
+errores frecuentes.
+
 Framework de redes neuronales escrito en **C11** con autodiferenciación,
 invocable desde Python. El núcleo numérico es una biblioteca C pura
 (sin dependencias externas; en macOS usa Apple Accelerate) y este paquete

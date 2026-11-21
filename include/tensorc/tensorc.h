@@ -4,6 +4,7 @@
 /* TensorC public API: compatible dense models plus N-dimensional autograd. */
 #include <minitf.h>
 #include <tensorc/ndtensor.h>
+#include <tensorc/rl.h>
 
 #ifdef __cplusplus
 extern "C" {

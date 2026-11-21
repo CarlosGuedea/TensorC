@@ -14,6 +14,8 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -801,6 +803,58 @@ static PyObject *module_cuda_device(PyObject *self, PyObject *args) {
     return PyLong_FromLong(tc_cuda_device());
 }
 
+static PyObject *module_preprocess_mnist_images(PyObject *self,
+                                               PyObject *args) {
+    (void)self;
+    PyObject *images_obj;
+    if (!PyArg_ParseTuple(args, "O", &images_obj)) return NULL;
+    Py_buffer view;
+    if (PyObject_GetBuffer(images_obj, &view,
+                           PyBUF_C_CONTIGUOUS | PyBUF_FORMAT | PyBUF_ND) < 0)
+        return NULL;
+    const char *format = view.format;
+    if (format && (*format == '@' || *format == '=' || *format == '<' ||
+                   *format == '>' || *format == '!')) ++format;
+    if (view.ndim != 3 || view.itemsize != 1 || !format || *format != 'B' ||
+        !view.shape || view.shape[0] <= 0 || view.shape[1] <= 0 ||
+        view.shape[2] <= 0) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_TypeError,
+                        "images debe ser un array uint8 contiguo [N, alto, ancho]");
+        return NULL;
+    }
+    const size_t n = (size_t)view.shape[0];
+    const size_t height = (size_t)view.shape[1];
+    const size_t width = (size_t)view.shape[2];
+    if (n > SIZE_MAX / height || n * height > SIZE_MAX / width ||
+        n * height * width > SIZE_MAX / sizeof(float) ||
+        n * height * width != (size_t)view.len) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_OverflowError, "images es demasiado grande o inválido");
+        return NULL;
+    }
+    const size_t count = n * height * width;
+    const uint8_t *source = (const uint8_t *)view.buf;
+    const size_t shape[] = {n, 1, height, width};
+    tc_tensor_nd *tensor = NULL;
+    float *converted = NULL;
+    Py_BEGIN_ALLOW_THREADS
+    tensor = tc_tensor_nd_create(shape, 4, 0);
+    converted = tensor ? tc_tensor_nd_data(tensor) : NULL;
+    if (converted)
+    for (size_t i = 0; i < count; ++i)
+        converted[i] = (float)source[i] * (1.0f / 255.0f);
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&view);
+    if (!tensor || !converted) {
+        tc_tensor_nd_free(tensor);
+        PyErr_SetString(PyExc_MemoryError,
+                        "no se pudo reservar Tensor para las imágenes");
+        return NULL;
+    }
+    return (PyObject *)tensor_wrap(tensor);
+}
+
 static PyMethodDef module_methods[] = {
     {"sinusoidal_positions", (PyCFunction)module_sinusoidal_positions,
      METH_VARARGS,
@@ -815,6 +869,9 @@ static PyMethodDef module_methods[] = {
      "cuda_set_device(i) -> True si el dispositivo i quedó activo."},
     {"cuda_device", (PyCFunction)module_cuda_device, METH_NOARGS,
      "cuda_device() -> índice del dispositivo activo o -1 sin backend."},
+    {"preprocess_mnist_images", (PyCFunction)module_preprocess_mnist_images,
+     METH_VARARGS,
+     "Convierte imágenes uint8 [N,H,W] a Tensor float32 normalizado [N,1,H,W]."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -895,6 +952,509 @@ static PyTypeObject DenseLayerType = {
     .tp_getset = dense_layer_getset,
     .tp_new = dense_layer_new,
     .tp_doc = "Trainable fully-connected layer.",
+};
+
+/* --- Operaciones para secuencias nativas --- */
+typedef struct {
+    PyObject_HEAD
+    size_t height, width;
+} NativeOpObject;
+
+static PyTypeObject ReLULayerType;
+static PyTypeObject MaxPool2DLayerType;
+static PyTypeObject FlattenLayerType;
+
+static void native_op_dealloc(NativeOpObject *self) { PyObject_Del(self); }
+
+static PyObject *native_op_new(PyTypeObject *type, PyObject *args,
+                               PyObject *kwargs) {
+    (void)kwargs;
+    if (type == &MaxPool2DLayerType) {
+        Py_ssize_t height, width;
+        if (!PyArg_ParseTuple(args, "nn", &height, &width)) return NULL;
+        if (!height || !width) {
+            PyErr_SetString(PyExc_ValueError, "pool dimensions must be positive");
+            return NULL;
+        }
+        NativeOpObject *self = PyObject_New(NativeOpObject, type);
+        if (!self) return NULL;
+        self->height = (size_t)height;
+        self->width = (size_t)width;
+        return (PyObject *)self;
+    }
+    if (PyTuple_GET_SIZE(args) != 0 || (kwargs && PyDict_Size(kwargs) != 0)) {
+        PyErr_SetString(PyExc_TypeError, "this layer takes no arguments");
+        return NULL;
+    }
+    NativeOpObject *self = PyObject_New(NativeOpObject, type);
+    if (!self) return NULL;
+    self->height = self->width = 0;
+    return (PyObject *)self;
+}
+
+static PyTypeObject ReLULayerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.ReLULayer",
+    .tp_basicsize = sizeof(NativeOpObject),
+    .tp_dealloc = (destructor)native_op_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = native_op_new,
+    .tp_doc = "Native ReLU operation for Sequential.",
+};
+
+static PyTypeObject MaxPool2DLayerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.MaxPool2DLayer",
+    .tp_basicsize = sizeof(NativeOpObject),
+    .tp_dealloc = (destructor)native_op_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = native_op_new,
+    .tp_doc = "Native max-pooling operation for Sequential.",
+};
+
+static PyTypeObject FlattenLayerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.FlattenLayer",
+    .tp_basicsize = sizeof(NativeOpObject),
+    .tp_dealloc = (destructor)native_op_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = native_op_new,
+    .tp_doc = "Native flatten operation for Sequential.",
+};
+
+typedef enum {
+    SEQ_CONV2D,
+    SEQ_DENSE,
+    SEQ_RELU,
+    SEQ_MAXPOOL2D,
+    SEQ_FLATTEN
+} SequentialKind;
+
+typedef struct {
+    SequentialKind kind;
+    PyObject *owner;
+    size_t height, width;
+} SequentialItem;
+
+typedef struct {
+    PyObject_HEAD
+    SequentialItem *items;
+    size_t count;
+    PyObject *params;
+    tc_tensor_nd_optimizer *optimizer;
+} SequentialObject;
+
+static PyTypeObject SequentialType;
+
+static int sequential_add_param(SequentialObject *self, tc_tensor_nd *param) {
+    tc_tensor_nd_retain(param);
+    PyObject *wrapped = (PyObject *)tensor_wrap(param);
+    if (!wrapped) return -1;
+    const int result = PyList_Append(self->params, wrapped);
+    Py_DECREF(wrapped);
+    return result;
+}
+
+static void sequential_dealloc(SequentialObject *self) {
+    if (self->items)
+        for (size_t i = 0; i < self->count; ++i) Py_XDECREF(self->items[i].owner);
+    PyMem_Free(self->items);
+    tc_tensor_nd_optimizer_free(self->optimizer);
+    Py_XDECREF(self->params);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyObject *sequential_new(PyTypeObject *type, PyObject *args,
+                                PyObject *kwargs) {
+    static char *names[] = {"layers", NULL};
+    PyObject *layers_obj;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", names, &layers_obj))
+        return NULL;
+    PyObject *layers = PySequence_Fast(layers_obj, "layers must be a sequence");
+    if (!layers) return NULL;
+    const Py_ssize_t count = PySequence_Fast_GET_SIZE(layers);
+    if (count == 0) {
+        Py_DECREF(layers);
+        PyErr_SetString(PyExc_ValueError, "layers cannot be empty");
+        return NULL;
+    }
+    SequentialObject *self = (SequentialObject *)type->tp_alloc(type, 0);
+    if (!self) {
+        Py_DECREF(layers);
+        return NULL;
+    }
+    self->count = (size_t)count;
+    self->items = PyMem_Calloc(self->count, sizeof(*self->items));
+    self->params = PyList_New(0);
+    if (!self->items || !self->params) {
+        Py_DECREF(layers);
+        Py_DECREF(self);
+        return PyErr_NoMemory();
+    }
+    for (Py_ssize_t i = 0; i < count; ++i) {
+        PyObject *layer = PySequence_Fast_GET_ITEM(layers, i);
+        SequentialItem *item = &self->items[i];
+        if (PyObject_TypeCheck(layer, &LayerType)) {
+            LayerObject *conv = (LayerObject *)layer;
+            item->kind = SEQ_CONV2D;
+            if (sequential_add_param(self, tc_conv2d_layer_kernel(conv->layer)) < 0 ||
+                sequential_add_param(self, tc_conv2d_layer_bias(conv->layer)) < 0)
+                goto fail;
+        } else if (PyObject_TypeCheck(layer, &DenseLayerType)) {
+            DenseLayerObject *dense = (DenseLayerObject *)layer;
+            item->kind = SEQ_DENSE;
+            if (sequential_add_param(self, tc_dense_layer_weight(dense->layer)) < 0 ||
+                sequential_add_param(self, tc_dense_layer_bias(dense->layer)) < 0)
+                goto fail;
+        } else if (PyObject_TypeCheck(layer, &ReLULayerType)) {
+            item->kind = SEQ_RELU;
+        } else if (PyObject_TypeCheck(layer, &MaxPool2DLayerType)) {
+            NativeOpObject *pool = (NativeOpObject *)layer;
+            item->kind = SEQ_MAXPOOL2D;
+            item->height = pool->height;
+            item->width = pool->width;
+        } else if (PyObject_TypeCheck(layer, &FlattenLayerType)) {
+            item->kind = SEQ_FLATTEN;
+        } else {
+            PyErr_SetString(PyExc_TypeError,
+                            "Sequential supports Conv2DLayer, DenseLayer, "
+                            "ReLULayer, MaxPool2DLayer, and FlattenLayer");
+            goto fail;
+        }
+        Py_INCREF(layer);
+        item->owner = layer;
+    }
+    Py_DECREF(layers);
+    if (self->items[self->count - 1].kind != SEQ_DENSE) {
+        Py_DECREF(self);
+        PyErr_SetString(PyExc_ValueError, "Sequential classifier must end in DenseLayer");
+        return NULL;
+    }
+    return (PyObject *)self;
+fail:
+    Py_DECREF(layers);
+    Py_DECREF(self);
+    return NULL;
+}
+
+static tc_tensor_nd *sequential_forward_tensor(SequentialObject *self,
+                                               const tc_tensor_nd *input) {
+    tc_tensor_nd *owned = NULL;
+    const tc_tensor_nd *current = input;
+    for (size_t i = 0; i < self->count; ++i) {
+        SequentialItem *item = &self->items[i];
+        tc_tensor_nd *next = NULL;
+        switch (item->kind) {
+        case SEQ_CONV2D:
+            next = tc_conv2d_layer_forward(((LayerObject *)item->owner)->layer,
+                                           current);
+            break;
+        case SEQ_DENSE:
+            next = tc_dense_layer_forward(((DenseLayerObject *)item->owner)->layer,
+                                          current);
+            break;
+        case SEQ_RELU:
+            next = tc_tensor_nd_relu(current);
+            break;
+        case SEQ_MAXPOOL2D:
+            next = tc_tensor_nd_maxpool2d(current, item->height, item->width);
+            break;
+        case SEQ_FLATTEN: {
+            const size_t n = tc_tensor_nd_shape(current)[0];
+            if (!n) break;
+            const size_t shape[] = {n, tc_tensor_nd_numel(current) / n};
+            next = tc_tensor_nd_reshape_to(current, shape, 2);
+            break;
+        }
+        }
+        tc_tensor_nd_free(owned);
+        if (!next) return NULL;
+        owned = next;
+        current = owned;
+    }
+    return owned;
+}
+
+static PyObject *sequential_forward(SequentialObject *self, PyObject *args) {
+    PyObject *input_obj;
+    if (!PyArg_ParseTuple(args, "O", &input_obj)) return NULL;
+    tc_tensor_nd *input = as_tensor(input_obj);
+    if (!input) return NULL;
+    return (PyObject *)tensor_wrap(sequential_forward_tensor(self, input));
+}
+
+static PyObject *sequential_get_params(SequentialObject *self, void *closure) {
+    (void)closure;
+    return PyList_GetSlice(self->params, 0, PyList_GET_SIZE(self->params));
+}
+
+static uint32_t sequential_rng(uint32_t *state) {
+    uint32_t value = *state ? *state : 1u;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    *state = value;
+    return value;
+}
+
+static int buffer_is_int32(const Py_buffer *view) {
+    const char *format = view->format;
+    if (!format) return 0;
+    if (*format == '@' || *format == '=' || *format == '<' ||
+        *format == '>' || *format == '!') ++format;
+    return *format == 'i' && view->itemsize == (Py_ssize_t)sizeof(int32_t);
+}
+
+static PyObject *sequential_fit_classifier(SequentialObject *self,
+                                           PyObject *args,
+                                           PyObject *kwargs) {
+    static char *names[] = {"x", "labels", "classes", "epochs",
+                            "batch_size", "learning_rate", "shuffle",
+                            "seed", NULL};
+    PyObject *x_obj, *labels_obj;
+    Py_ssize_t classes_arg, epochs_arg, batch_arg;
+    double learning_rate;
+    int shuffle;
+    unsigned long seed;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OOnnndpk", names,
+                                     &x_obj, &labels_obj, &classes_arg,
+                                     &epochs_arg, &batch_arg, &learning_rate,
+                                     &shuffle, &seed))
+        return NULL;
+    tc_tensor_nd *x = as_tensor(x_obj);
+    if (!x) return NULL;
+    const size_t ndim = tc_tensor_nd_ndim(x);
+    const size_t *shape = tc_tensor_nd_shape(x);
+    const size_t n = ndim ? shape[0] : 0;
+    const size_t numel = tc_tensor_nd_numel(x);
+    if (ndim < 2 || ndim > 8 || n == 0 || classes_arg < 2 ||
+        epochs_arg <= 0 || batch_arg <= 0 || !(learning_rate > 0.0) ||
+        !isfinite(learning_rate) || n > SIZE_MAX / sizeof(size_t)) {
+        PyErr_SetString(PyExc_ValueError, "invalid native classifier input or options");
+        return NULL;
+    }
+    SequentialItem *last = &self->items[self->count - 1];
+    tc_tensor_nd *bias = tc_dense_layer_bias(((DenseLayerObject *)last->owner)->layer);
+    const size_t *bias_shape = tc_tensor_nd_shape(bias);
+    if (!bias_shape || bias_shape[1] != (size_t)classes_arg) {
+        PyErr_SetString(PyExc_ValueError, "classes do not match final DenseLayer");
+        return NULL;
+    }
+    Py_buffer labels_view;
+    if (PyObject_GetBuffer(labels_obj, &labels_view,
+                           PyBUF_C_CONTIGUOUS | PyBUF_FORMAT) < 0)
+        return NULL;
+    if (!buffer_is_int32(&labels_view) ||
+        labels_view.len != (Py_ssize_t)n * (Py_ssize_t)sizeof(int32_t)) {
+        PyBuffer_Release(&labels_view);
+        PyErr_SetString(PyExc_TypeError, "native labels must be contiguous int32 with one label per row");
+        return NULL;
+    }
+    const int32_t *labels = (const int32_t *)labels_view.buf;
+    for (size_t i = 0; i < n; ++i) {
+        if (labels[i] < 0 || labels[i] >= classes_arg) {
+            PyBuffer_Release(&labels_view);
+            PyErr_SetString(PyExc_ValueError, "encoded label is outside classes range");
+            return NULL;
+        }
+    }
+    const size_t sample_size = numel / n;
+    const size_t batch_size = (size_t)batch_arg < n ? (size_t)batch_arg : n;
+    if (!sample_size || sample_size > SIZE_MAX / batch_size / sizeof(float) ||
+        (size_t)classes_arg > SIZE_MAX / batch_size / sizeof(float)) {
+        PyBuffer_Release(&labels_view);
+        PyErr_SetString(PyExc_OverflowError, "native batch is too large");
+        return NULL;
+    }
+    size_t *order = (size_t *)malloc(n * sizeof(size_t));
+    float *batch_data = (float *)malloc(batch_size * sample_size * sizeof(float));
+    float *targets = (float *)malloc(batch_size * (size_t)classes_arg * sizeof(float));
+    float *epoch_losses = (float *)calloc((size_t)epochs_arg, sizeof(float));
+    const size_t param_count = (size_t)PyList_GET_SIZE(self->params);
+    tc_tensor_nd **params = (tc_tensor_nd **)malloc(param_count * sizeof(*params));
+    if (!order || !batch_data || !targets || !epoch_losses || !params) {
+        free(order); free(batch_data); free(targets); free(epoch_losses); free(params);
+        PyBuffer_Release(&labels_view);
+        return PyErr_NoMemory();
+    }
+    for (size_t i = 0; i < param_count; ++i)
+        params[i] = ((TensorObject *)PyList_GET_ITEM(self->params, (Py_ssize_t)i))->tensor;
+    if (!self->optimizer)
+        self->optimizer = tc_tensor_nd_optimizer_adam(
+            params, param_count, (float)learning_rate);
+    else
+        tc_tensor_nd_optimizer_set_lr(self->optimizer, (float)learning_rate);
+    if (!self->optimizer) {
+        free(order); free(batch_data); free(targets); free(epoch_losses); free(params);
+        PyBuffer_Release(&labels_view);
+        PyErr_SetString(PyExc_RuntimeError, "could not create native Adam optimizer");
+        return NULL;
+    }
+    const float *x_data = tc_tensor_nd_const_data(x);
+    int ok = x_data != NULL;
+    uint32_t rng = (uint32_t)seed;
+    Py_BEGIN_ALLOW_THREADS
+    for (size_t epoch = 0; ok && epoch < (size_t)epochs_arg; ++epoch) {
+        for (size_t i = 0; i < n; ++i) order[i] = i;
+        if (shuffle) {
+            for (size_t i = n; i > 1; --i) {
+                const size_t j = sequential_rng(&rng) % i;
+                const size_t tmp = order[i - 1];
+                order[i - 1] = order[j];
+                order[j] = tmp;
+            }
+        }
+        float total_loss = 0.0f;
+        size_t seen = 0;
+        for (size_t start = 0; ok && start < n; start += batch_size) {
+            const size_t count = n - start < batch_size ? n - start : batch_size;
+            memset(targets, 0, count * (size_t)classes_arg * sizeof(float));
+            for (size_t row = 0; row < count; ++row) {
+                const size_t source = order[start + row];
+                memcpy(batch_data + row * sample_size,
+                       x_data + source * sample_size,
+                       sample_size * sizeof(float));
+                targets[row * (size_t)classes_arg + (size_t)labels[source]] = 1.0f;
+            }
+            size_t input_shape[8];
+            memcpy(input_shape, shape, ndim * sizeof(size_t));
+            input_shape[0] = count;
+            const size_t target_shape[] = {count, (size_t)classes_arg};
+            tc_tensor_nd *input = tc_tensor_nd_from_data(input_shape, ndim,
+                                                         batch_data, 0);
+            tc_tensor_nd *target = tc_tensor_nd_from_data(target_shape, 2,
+                                                          targets, 0);
+            tc_tensor_nd *logits = input ? sequential_forward_tensor(self, input) : NULL;
+            tc_tensor_nd *probabilities = logits ? tc_tensor_nd_softmax(logits) : NULL;
+            tc_tensor_nd *loss = probabilities
+                ? tc_tensor_nd_cross_entropy(probabilities, target) : NULL;
+            ok = input && target && logits && probabilities && loss &&
+                 tc_tensor_nd_backward(loss) &&
+                 tc_tensor_nd_optimizer_step(self->optimizer);
+            if (ok) {
+                const float *loss_data = tc_tensor_nd_const_data(loss);
+                ok = loss_data != NULL;
+                if (ok) total_loss += loss_data[0] * (float)count;
+                if (ok) seen += count;
+            }
+            tc_tensor_nd_free(loss);
+            tc_tensor_nd_free(probabilities);
+            tc_tensor_nd_free(logits);
+            tc_tensor_nd_free(target);
+            tc_tensor_nd_free(input);
+        }
+        if (ok && seen) epoch_losses[epoch] = total_loss / (float)seen;
+        else ok = 0;
+    }
+    Py_END_ALLOW_THREADS
+    free(order); free(batch_data); free(targets); free(params);
+    PyBuffer_Release(&labels_view);
+    if (!ok) {
+        free(epoch_losses);
+        PyErr_SetString(PyExc_RuntimeError, "native C training step failed");
+        return NULL;
+    }
+    PyObject *losses = PyList_New(epochs_arg);
+    if (!losses) { free(epoch_losses); return NULL; }
+    for (Py_ssize_t i = 0; i < epochs_arg; ++i)
+        PyList_SET_ITEM(losses, i, PyFloat_FromDouble(epoch_losses[i]));
+    free(epoch_losses);
+    return losses;
+}
+
+static PyObject *sequential_predict_proba(SequentialObject *self,
+                                         PyObject *args,
+                                         PyObject *kwargs) {
+    static char *names[] = {"x", "batch_size", NULL};
+    PyObject *x_obj;
+    Py_ssize_t batch_arg = 256;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|n", names,
+                                     &x_obj, &batch_arg)) return NULL;
+    tc_tensor_nd *x = as_tensor(x_obj);
+    if (!x) return NULL;
+    const size_t ndim = tc_tensor_nd_ndim(x);
+    const size_t *shape = tc_tensor_nd_shape(x);
+    const size_t n = ndim ? shape[0] : 0;
+    const size_t numel = tc_tensor_nd_numel(x);
+    const size_t classes = tc_tensor_nd_shape(
+        tc_dense_layer_bias(((DenseLayerObject *)self->items[self->count - 1].owner)->layer))[1];
+    if (ndim < 2 || ndim > 8 || n == 0 || batch_arg <= 0 ||
+        classes > SIZE_MAX / n / sizeof(float)) {
+        PyErr_SetString(PyExc_ValueError, "invalid native prediction input");
+        return NULL;
+    }
+    const size_t sample_size = numel / n;
+    const size_t batch_size = (size_t)batch_arg < n ? (size_t)batch_arg : n;
+    if (!sample_size || sample_size > SIZE_MAX / batch_size / sizeof(float)) {
+        PyErr_SetString(PyExc_OverflowError, "native prediction batch is too large");
+        return NULL;
+    }
+    float *batch_data = (float *)malloc(batch_size * sample_size * sizeof(float));
+    float *output = (float *)malloc(n * classes * sizeof(float));
+    if (!batch_data || !output) {
+        free(batch_data); free(output);
+        return PyErr_NoMemory();
+    }
+    const float *x_data = tc_tensor_nd_const_data(x);
+    int ok = x_data != NULL;
+    Py_BEGIN_ALLOW_THREADS
+    for (size_t start = 0; ok && start < n; start += batch_size) {
+        const size_t count = n - start < batch_size ? n - start : batch_size;
+        memcpy(batch_data, x_data + start * sample_size,
+               count * sample_size * sizeof(float));
+        size_t input_shape[8];
+        memcpy(input_shape, shape, ndim * sizeof(size_t));
+        input_shape[0] = count;
+        tc_tensor_nd *input = tc_tensor_nd_from_data(input_shape, ndim,
+                                                     batch_data, 0);
+        tc_tensor_nd *logits = input ? sequential_forward_tensor(self, input) : NULL;
+        tc_tensor_nd *probabilities = logits ? tc_tensor_nd_softmax(logits) : NULL;
+        const float *values = tc_tensor_nd_const_data(probabilities);
+        ok = input && logits && probabilities && values;
+        if (ok) memcpy(output + start * classes, values,
+                       count * classes * sizeof(float));
+        tc_tensor_nd_free(probabilities);
+        tc_tensor_nd_free(logits);
+        tc_tensor_nd_free(input);
+    }
+    Py_END_ALLOW_THREADS
+    free(batch_data);
+    if (!ok) {
+        free(output);
+        PyErr_SetString(PyExc_RuntimeError, "native C prediction failed");
+        return NULL;
+    }
+    const size_t out_shape[] = {n, classes};
+    tc_tensor_nd *result = tc_tensor_nd_from_data(out_shape, 2, output, 0);
+    free(output);
+    return (PyObject *)tensor_wrap(result);
+}
+
+static PyMethodDef sequential_methods[] = {
+    {"forward", (PyCFunction)sequential_forward, METH_VARARGS,
+     "Run the native C forward pass."},
+    {"_fit_classifier", (PyCFunction)sequential_fit_classifier,
+     METH_VARARGS | METH_KEYWORDS, "Train in C with cross-entropy and Adam."},
+    {"predict_proba", (PyCFunction)sequential_predict_proba,
+     METH_VARARGS | METH_KEYWORDS, "Predict probabilities in C."},
+    {NULL, NULL, 0, NULL}
+};
+
+static PyGetSetDef sequential_getset[] = {
+    {"params", (getter)sequential_get_params, NULL, "Trainable tensors.", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
+};
+
+static PyTypeObject SequentialType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "tensorc.Sequential",
+    .tp_basicsize = sizeof(SequentialObject),
+    .tp_dealloc = (destructor)sequential_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_methods = sequential_methods,
+    .tp_getset = sequential_getset,
+    .tp_new = sequential_new,
+    .tp_doc = "Sequential TensorC layers executed by the native C core.",
 };
 
 /* --- Capa LSTM --- */
@@ -1179,6 +1739,10 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyType_Ready(&TensorType) < 0) return NULL;
     if (PyType_Ready(&LayerType) < 0) return NULL;
     if (PyType_Ready(&DenseLayerType) < 0) return NULL;
+    if (PyType_Ready(&ReLULayerType) < 0) return NULL;
+    if (PyType_Ready(&MaxPool2DLayerType) < 0) return NULL;
+    if (PyType_Ready(&FlattenLayerType) < 0) return NULL;
+    if (PyType_Ready(&SequentialType) < 0) return NULL;
     if (PyType_Ready(&LSTMLayerType) < 0) return NULL;
     if (PyType_Ready(&TransformerBlockType) < 0) return NULL;
     if (PyType_Ready(&OptimizerType) < 0) return NULL;
@@ -1200,6 +1764,34 @@ PyMODINIT_FUNC PyInit__tensorc(void) {
     if (PyModule_AddObject(module, "DenseLayer",
                            (PyObject *)&DenseLayerType) < 0) {
         Py_DECREF(&DenseLayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&ReLULayerType);
+    if (PyModule_AddObject(module, "ReLULayer",
+                           (PyObject *)&ReLULayerType) < 0) {
+        Py_DECREF(&ReLULayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&MaxPool2DLayerType);
+    if (PyModule_AddObject(module, "MaxPool2DLayer",
+                           (PyObject *)&MaxPool2DLayerType) < 0) {
+        Py_DECREF(&MaxPool2DLayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&FlattenLayerType);
+    if (PyModule_AddObject(module, "FlattenLayer",
+                           (PyObject *)&FlattenLayerType) < 0) {
+        Py_DECREF(&FlattenLayerType);
+        Py_DECREF(module);
+        return NULL;
+    }
+    Py_INCREF(&SequentialType);
+    if (PyModule_AddObject(module, "Sequential",
+                           (PyObject *)&SequentialType) < 0) {
+        Py_DECREF(&SequentialType);
         Py_DECREF(module);
         return NULL;
     }

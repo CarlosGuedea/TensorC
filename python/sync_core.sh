@@ -5,8 +5,9 @@
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$ROOT/python/tensorc/core"
-cp "$ROOT/minitf.c" "$ROOT/ndtensor.c" "$ROOT/minitf.h" "$PY/"
+cp "$ROOT/minitf.c" "$ROOT/ndtensor.c" "$ROOT/rl.c" "$ROOT/minitf.h" "$PY/"
 cp "$ROOT/tensorc_cuda.cu" "$ROOT/tensorc_cuda_internal.h" "$PY/"
 cp "$ROOT/include/tensorc/ndtensor.h" "$ROOT/include/tensorc/tensorc.h" \
+   "$ROOT/include/tensorc/rl.h" \
    "$PY/include/tensorc/"
 echo "núcleo sincronizado en python/tensorc/core/"

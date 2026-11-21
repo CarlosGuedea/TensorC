@@ -210,10 +210,13 @@ X = np.array([
 ], dtype=np.float32)
 y = np.array([0, 1, 1, 1])
 
-layer = tensorc.DenseLayer(2, 2, seed=7)
+network = tensorc.Sequential([
+    tensorc.DenseLayer(2, 8, seed=7),
+    tensorc.ReLULayer(),
+    tensorc.DenseLayer(8, 2, seed=8),
+])
 clf = tensorc.TensorCClassifier(
-    forward=lambda value: layer.forward(value),
-    params=[layer.weight, layer.bias],
+    model=network,
     epochs=300, batch_size=4,
     learning_rate=0.05,
     random_state=42, verbose=False,
@@ -226,57 +229,60 @@ print("exactitud:", clf.score(X, y))
 clf.save("clasificador.tck")
 ~~~
 
-La función forward debe recibir un tensor TensorC y devolver logits con forma
-[muestras, clases]. El clasificador aplica softmax y cross-entropy.
+Con `model=Sequential(...)`, el forward, la pérdida, el entrenamiento por
+lotes y la predicción se ejecutan en C. La forma anterior con `forward` y
+`params` sigue disponible para modelos personalizados y conserva su bucle de
+entrenamiento en Python.
 
 ## 9. MNIST completo
 
-TensorFlow solo se utiliza para descargar MNIST. La red, el autodiferenciador
-y Adam son de TensorC.
+El ejemplo lee MNIST desde el archivo `.npz` en la caché de Keras; no importa
+TensorFlow. NumPy solo abre el archivo. `preprocess_mnist_images` convierte
+las imágenes uint8 a float32, normaliza sus valores y agrega el canal en C.
+El entrenamiento y la inferencia de `Sequential` también se ejecutan en C.
+
+Para comparar solo la preparación Python/NumPy frente a C:
 
 ~~~bash
-python -m pip install tensorflow
+python examples/benchmark_mnist_preprocessing.py
 ~~~
+
+El benchmark usa las 60,000 imágenes de entrenamiento y muestra la mediana de
+cinco ejecuciones por ruta; no incluye carga del archivo ni entrenamiento.
+
+Para comparar entrenamiento e inferencia de la misma CNN con NumPy y TensorC:
+
+~~~bash
+python examples/benchmark_mnist_cnn_numpy.py
+~~~
+
+Este ejemplo usa 8,192 imágenes para entrenar, 2,048 para probar y comparte
+pesos iniciales, orden de minibatches y número de épocas entre ambas rutas.
 
 ~~~python
 import numpy as np
-import tensorflow as tf
 import tensorc
+from pathlib import Path
 
-(X_train, y_train), (X_test, y_test) = \
-    tf.keras.datasets.mnist.load_data()
+with np.load(Path.home() / ".keras/datasets/mnist.npz") as mnist:
+    X_train, y_train = mnist["x_train"], mnist["y_train"]
+    X_test, y_test = mnist["x_test"], mnist["y_test"]
 
-X_train = np.ascontiguousarray(
-    X_train[:, None, :, :].astype(np.float32) / 255.0
-)
-X_test = np.ascontiguousarray(
-    X_test[:, None, :, :].astype(np.float32) / 255.0
-)
+X_train = tensorc.preprocess_mnist_images(X_train)
+X_test = tensorc.preprocess_mnist_images(X_test)
 
-class MNISTNetwork:
-    def __init__(self):
-        self.conv1 = tensorc.Conv2DLayer(
-            1, 8, 3, 3, padding=(1, 1), seed=101
-        )
-        self.conv2 = tensorc.Conv2DLayer(
-            8, 16, 3, 3, padding=(1, 1), seed=202
-        )
-        self.output = tensorc.DenseLayer(16 * 7 * 7, 10, seed=303)
-        self.params = [
-            self.conv1.kernel, self.conv1.bias,
-            self.conv2.kernel, self.conv2.bias,
-            self.output.weight, self.output.bias,
-        ]
-
-    def forward(self, x):
-        x = self.conv1.forward(x).relu().maxpool2d(2, 2)
-        x = self.conv2.forward(x).relu().maxpool2d(2, 2)
-        x = x.reshape((int(x.shape[0]), 16 * 7 * 7))
-        return self.output.forward(x)
-
-network = MNISTNetwork()
+network = tensorc.Sequential([
+    tensorc.Conv2DLayer(1, 8, 3, 3, padding=(1, 1), seed=101),
+    tensorc.ReLULayer(),
+    tensorc.MaxPool2DLayer(2, 2),
+    tensorc.Conv2DLayer(8, 16, 3, 3, padding=(1, 1), seed=202),
+    tensorc.ReLULayer(),
+    tensorc.MaxPool2DLayer(2, 2),
+    tensorc.FlattenLayer(),
+    tensorc.DenseLayer(16 * 7 * 7, 10, seed=303),
+])
 clf = tensorc.TensorCClassifier(
-    forward=network.forward, params=network.params,
+    model=network,
     epochs=5, batch_size=64,
     learning_rate=0.001, random_state=42,
 )
@@ -450,6 +456,115 @@ print(f"Entrenamiento: {elapsed:.3f} segundos")
 
 Separa carga, preparación, entrenamiento, evaluación y guardado. La descarga
 inicial de MNIST no representa el tiempo de entrenamiento.
+
+## DQN en C11
+
+TensorC incluye una API C experimental de DQN para observaciones vectoriales y
+acciones discretas. El agente ofrece una MLP densa, replay uniforme, red
+objetivo, epsilon-greedy, TD(0), MSE y Adam. El programa C del usuario conserva
+el ciclo del entorno y llama a `tc_dqn_select_action`, `tc_dqn_remember` y
+`tc_dqn_train_step`; este último devuelve `TC_DQN_TRAIN_NOT_READY` hasta llenar
+el primer minibatch y sincroniza la red objetivo automáticamente según la
+configuración. Para el entorno, `tc_env` ofrece una interfaz C estilo Gymnasium:
+observaciones como vector `float`, acciones discretas, `tc_env_reset` y
+`tc_env_step`.
+
+~~~c
+tc_env env = {
+    .observation_size = 4,
+    .action_count = 2,
+    .user_data = &mi_estado,
+    .reset = mi_reset,
+    .step = mi_step,
+    .close = mi_close, /* opcional */
+};
+float observation[4], reward;
+int terminated, truncated;
+tc_env_reset(&env, seed, observation);
+tc_env_step(&env, action, observation, &reward, &terminated, &truncated);
+~~~
+
+Ambas señales terminan el episodio. Pasa `terminated` como el último argumento
+de `tc_dqn_remember`: una terminación real detiene el bootstrap y un límite de
+tiempo (`truncated`) conserva el bootstrap. El callback `close` es opcional y
+`tc_env_close` invalida el descriptor después de cerrarlo. El descriptor y su
+estado son propiedad del llamador. Esta API no carga entornos de Gymnasium para
+Python; permite implementar entornos con un contrato similar directamente en C.
+
+Compila y ejecuta el ejemplo CartPole, cuya dinámica, agente y entrenamiento
+son C11:
+
+~~~bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target tensorc_dqn_cartpole
+./build/tensorc_dqn_cartpole
+~~~
+
+La API no cubre acciones continuas ni PPO/actor-critic. El ejemplo reporta
+recompensa media y tiempo de entrenamiento.
+
+### Ejemplo con lugares y fotos
+
+`experiments/study_classifier/dqn_study_bandit.c` usa el CNN multimodal
+existente como extractor visual congelado. Para cada lugar combina su embedding
+visual de 16 valores con 11 metadatos y el DQN elige `no_apto` o `apto`. Una
+decisión correcta recibe +1; una incorrecta, -1. Es un contextual bandit de un
+paso porque el ZIP contiene etiquetas, no trayectorias. El CNN se entrenó con
+esas mismas etiquetas, así que el ejemplo ilustra la API RL y no demuestra que
+RL supere al entrenamiento supervisado.
+
+El target requiere libjpeg y está disponible si CMake encuentra esa biblioteca.
+Extrae el ZIP y ejecuta:
+
+~~~bash
+unzip -q /ruta/Datos-Supabase-2026-11-18.zip -d /tmp/study-data
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target tensorc_dqn_study_bandit
+./build/tensorc_dqn_study_bandit \
+  /tmp/study-data/Datos-Supabase-2026-11-18 \
+  experiments/study_classifier/results/manifest.csv \
+  experiments/study_classifier/results/study_classifier_multimodal.tck
+~~~
+
+La carpeta del dataset debe contener `datos.csv` y `fotos/`. El programa usa el
+split `train` para entrenamiento y `test` para evaluación; ignora `incierto`.
+En una corrida sobre las 47 filas de prueba obtuvo 89.36 % de exactitud, 93.75 %
+de precisión, 78.95 % de recall y F1 de 85.71 % para `apto`; la matriz fue
+`[[27,1],[4,15]]`. Consulta el [README del experimento](experiments/study_classifier/README.md)
+para metodología, tiempos y limitaciones.
+
+Para clasificar una foto nueva durante la misma ejecución DQN, agrega después
+del checkpoint estos argumentos: `PHOTO TEMP_C HUMIDITY_PCT PEOPLE HAS_TABLE
+OCCUPANCY SPACE_TYPE SOUND_DBFS`. Ejemplo para una foto interior con mesa,
+despejada, 32 °C, cero personas y −22 dBFS:
+
+~~~bash
+./build/tensorc_dqn_study_bandit \
+  /tmp/study-data/Datos-Supabase-2026-11-18 \
+  experiments/study_classifier/results/manifest.csv \
+  experiments/study_classifier/results/study_classifier_multimodal.tck \
+  /ruta/foto.jpg 32 '' 0 True despejado interior -22
+~~~
+
+El DQN devuelve la acción `apto`/`no_apto`, no una probabilidad calibrada.
+
+### Implementación Python/NumPy
+
+`tensorc.DQNAgent` ofrece la misma interfaz básica para observaciones vectoriales
+y acciones discretas, implementada en Python/NumPy. El ejemplo
+`experiments/study_classifier/dqn_study_bandit_python.py` lee el ZIP directamente
+y extrae HOG, color y 11 metadatos en Python, sin usar CNN/DQN C:
+
+~~~bash
+PYTHONPATH=python python experiments/study_classifier/dqn_study_bandit_python.py \
+  --zip /ruta/Datos-Supabase-2026-11-18.zip \
+  --photo /ruta/IMG00026.jpg --temperature-c 32 --people 0 \
+  --has-table true --occupancy despejado --space-type interior --sound-dbfs -22
+~~~
+
+Guarda `policy.npz`, métricas y predicciones en `results/python_dqn/`. Al ser
+una decisión de un paso entrenada con las etiquetas del ZIP, es un ejemplo de
+contextual bandit, no evidencia de aprendizaje de una política interactiva.
 
 ## 15. Enlaces
 

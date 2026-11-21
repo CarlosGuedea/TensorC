@@ -7,6 +7,8 @@ TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una 
 
 La versión 0.15.0 está enfocada en CPU y modelos pequeños. Incluye operaciones N-dimensionales, un grafo de operaciones con conteo de referencia, gradientes automáticos para suma, producto elemento a elemento, broadcasting, multiplicación de matrices 2D, convolución 2D con stride y padding configurables, max pooling, reshape dentro del grafo, ReLU, softmax, suma, pérdida MSE y cross-entropy, además de capas densas y convolucionales con inicialización Xavier y optimizador Adam. También permite guardar y cargar checkpoints con un formato binario versionado. En macOS usa Apple Accelerate para multiplicaciones grandes y para la ruta im2col de convoluciones grandes, y conserva un backend genérico para otras plataformas. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. Todavía no incluye GPU ni importación directa de modelos de TensorFlow.
 
+El código fuente también incorpora una API C experimental para DQN con acciones discretas, replay buffer y red objetivo. `tc_env` ofrece un contrato de entornos C estilo Gymnasium (`reset`/`step`, `terminated`/`truncated`); `tensorc_dqn_cartpole` muestra entrenamiento sin Python. Consulta [la guía de DQN](GUIA_USO.md#dqn-en-c11) para compilarlo.
+
 ## Compilar
 
 Requisitos: CMake 3.16 o superior y un compilador C11.

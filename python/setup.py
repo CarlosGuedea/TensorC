@@ -89,6 +89,7 @@ extension = Extension(
     sources=[
         "tensorc/core/minitf.c",
         "tensorc/core/ndtensor.c",
+        "tensorc/core/rl.c",
         "tensorc/_tensorc.c",
     ],
     include_dirs=["tensorc/core/include", "tensorc/core"],

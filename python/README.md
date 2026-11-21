@@ -4,6 +4,10 @@ Consulta la [guía detallada de uso](../GUIA_USO.md) para instalación,
 entrenamiento, CNN, MNIST, C11, el wrapper estilo scikit-learn y solución de
 errores frecuentes.
 
+El paquete también ofrece `tensorc.DQNAgent`, una implementación experimental
+de DQN con NumPy para observaciones vectoriales y acciones discretas. Sus
+operaciones se ejecutan en Python/NumPy; la API DQN C es independiente.
+
 Framework de redes neuronales escrito en **C11** con autodiferenciación,
 invocable desde Python. El núcleo numérico es una biblioteca C pura
 (sin dependencias externas; en macOS usa Apple Accelerate) y este paquete
@@ -131,17 +135,22 @@ model2.load_weights("modelo.tck")  # valida formas y copia los pesos
 
 ### Clasificador estilo scikit-learn
 
-`TensorCClassifier` recibe arrays NumPy y conserva el cálculo de la red,
-autograd y Adam en TensorC:
+`TensorCClassifier` acepta dos rutas. Con `model=Sequential(...)`, el forward,
+autograd, Adam, minibatches, `predict` y `predict_proba` se ejecutan en C. La
+ruta de callbacks `forward`/`params` conserva compatibilidad, pero su bucle de
+minibatches sigue en Python.
 
 ```python
 import numpy as np
 import tensorc
 
-layer = tensorc.DenseLayer(4, 2, seed=7)
+model = tensorc.Sequential([
+    tensorc.DenseLayer(4, 16, seed=7),
+    tensorc.ReLULayer(),
+    tensorc.DenseLayer(16, 2, seed=8),
+])
 clf = tensorc.TensorCClassifier(
-    forward=lambda x: layer.forward(x),
-    params=[layer.weight, layer.bias],
+    model=model,
     epochs=100,
     batch_size=32,
     learning_rate=0.001,
@@ -152,6 +161,10 @@ probabilidades = clf.predict_proba(X_test)
 exactitud = clf.score(X_test, y_test)
 clf.save("clasificador.tck")
 ```
+
+`Sequential` admite `DenseLayer`, `Conv2DLayer`, `ReLULayer`,
+`MaxPool2DLayer` y `FlattenLayer`. Para imágenes MNIST, `preprocess_mnist_images`
+convierte uint8 `[N,H,W]` a Tensor float32 normalizado `[N,1,H,W]` en C.
 
 La interfaz incluye `fit`, `predict`, `predict_proba`, `score`, `get_params`,
 `set_params`, `save` y `load_weights`.

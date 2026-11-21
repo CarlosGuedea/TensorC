@@ -6,7 +6,7 @@ option(TENSORC_BUILD_BENCHMARKS "Build TensorC benchmarks" ON)
 option(TENSORC_USE_ACCELERATE "Use Apple Accelerate for large matrix operations" ON)
 option(TENSORC_USE_CUDA "Use NVIDIA CUDA backend for large tensor operations" OFF)
 
-add_library(tensorc minitf.c ndtensor.c)
+add_library(tensorc minitf.c ndtensor.c rl.c)
 add_library(TensorC::tensorc ALIAS tensorc)
 target_compile_features(tensorc PUBLIC c_std_11)
 target_include_directories(tensorc
@@ -63,6 +63,17 @@ if(TENSORC_BUILD_EXAMPLES)
     target_link_libraries(tensorc_cnn_mnist PRIVATE TensorC::tensorc)
     add_executable(tensorc_study_classifier examples/study_classifier.c)
     target_link_libraries(tensorc_study_classifier PRIVATE TensorC::tensorc)
+    add_executable(tensorc_dqn_cartpole examples/dqn_cartpole.c)
+    target_link_libraries(tensorc_dqn_cartpole PRIVATE TensorC::tensorc)
+    find_package(JPEG QUIET)
+    if(JPEG_FOUND)
+        add_executable(tensorc_dqn_study_bandit
+            experiments/study_classifier/dqn_study_bandit.c)
+        target_link_libraries(tensorc_dqn_study_bandit PRIVATE
+            TensorC::tensorc JPEG::JPEG)
+    else()
+        message(STATUS "libjpeg not found; skipping tensorc_dqn_study_bandit")
+    endif()
 endif()
 
 if(TENSORC_BUILD_BENCHMARKS)
@@ -130,6 +141,7 @@ install(TARGETS tensorc EXPORT TensorCTargets
 )
 install(FILES minitf.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES include/tensorc/ndtensor.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tensorc)
+install(FILES include/tensorc/rl.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tensorc)
 install(EXPORT TensorCTargets NAMESPACE TensorC:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/TensorC)
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/TensorCConfig.cmake

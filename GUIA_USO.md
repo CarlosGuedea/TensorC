@@ -1,13 +1,36 @@
-# Guía detallada de uso de TensorC
+# Manual de uso de TensorC
 
-> El proyecto se llama **TensorC**. Esta guía cubre instalación, Python,
-> C11, CNN, MNIST, el wrapper estilo scikit-learn y errores frecuentes.
+TensorC es un framework de redes neuronales con núcleo C11 y bindings para
+Python. Este manual cubre instalación, tensores, entrenamiento, clasificación,
+MNIST, aprendizaje por refuerzo y la API C. TensorFlow y PyTorch no son
+requisitos.
+
+## Contenido
+
+1. [Qué es TensorC](#1-qué-es-tensorc)
+2. [Instalación](#2-instalación)
+3. [Verificar la instalación](#3-verificar-la-instalación)
+4. [Tensores y autodiferenciación](#4-tensores-y-autodiferenciación)
+5. [Regresión lineal con Adam](#5-regresión-lineal-con-adam)
+6. [Entrenamiento con Model](#6-entrenamiento-con-model)
+7. [Capas densas y convolucionales](#7-capas-densas-y-convolucionales)
+8. [Wrapper estilo scikit-learn](#8-wrapper-estilo-scikit-learn)
+9. [MNIST completo](#9-mnist-completo)
+10. [Clasificador de lugares para estudiar](#10-clasificador-de-lugares-para-estudiar)
+11. [Guardar y cargar pesos](#11-guardar-y-cargar-pesos)
+12. [Compilar y usar TensorC desde C11](#12-compilar-y-usar-tensorc-desde-c11)
+13. [Problemas frecuentes](#13-problemas-frecuentes)
+14. [Medición de rendimiento](#14-medición-de-rendimiento)
+15. [Aprendizaje por refuerzo](#15-aprendizaje-por-refuerzo)
+16. [Enlaces](#16-enlaces)
 
 ## 1. ¿Qué es TensorC?
 
-TensorC es un framework pequeño de redes neuronales con un núcleo numérico
-escrito en C11. Python prepara los datos y define el flujo, mientras que las
-operaciones, el grafo de autodiferenciación y Adam se ejecutan en el núcleo C.
+TensorC es un framework pequeño de redes neuronales con núcleo numérico en C11.
+Con `TensorCClassifier(model=Sequential(...))`, las operaciones, el autograd,
+Adam y el entrenamiento por lotes se ejecutan en C. Python controla el programa
+y puede cargar y preparar datos. La API experimental `tensorc.DQNAgent` es una
+implementación independiente en Python/NumPy.
 
 Incluye:
 
@@ -20,7 +43,7 @@ Incluye:
 - guardado y carga de checkpoints;
 - API nativa C11 y bindings para Python.
 
-## 2. Instalación desde PyPI
+## 2. Instalación
 
 Se recomienda utilizar un entorno virtual.
 
@@ -32,7 +55,7 @@ cd prueba_tensorc
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install tensorc numpy
+python -m pip install tensorc
 ~~~
 
 ### Windows PowerShell
@@ -43,11 +66,31 @@ cd prueba_tensorc
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install tensorc numpy
+python -m pip install tensorc
 ~~~
 
 Usa python -m pip en lugar de pip para garantizar que el paquete se instala
 en el mismo intérprete que ejecutará el programa.
+
+NumPy se instala como dependencia de TensorC. Los ejemplos con imágenes
+requieren Pillow; el notebook clásico agrega scikit-learn y joblib:
+
+~~~bash
+python -m pip install pillow
+python -m pip install scikit-learn joblib
+~~~
+
+### Código más reciente de GitHub
+
+PyPI instala la versión publicada. Para usar funciones añadidas después de la
+publicación, como `tensorc.DQNAgent`, instala `main` directamente:
+
+~~~bash
+python -m pip install "git+https://github.com/CarlosGuedea/TensorC.git@main#subdirectory=python"
+~~~
+
+Para desarrollar desde un clon, ejecuta `python -m pip install -e ./python`
+desde la raíz del repositorio.
 
 ## 3. Verificar la instalación
 
@@ -195,6 +238,10 @@ print(features.shape)  # (8, 16, 32, 32)
 Los parámetros entrenables son layer.weight, layer.bias, conv.kernel y
 conv.bias.
 
+Para ejemplos de `LSTMLayer` (entrada `[seq, batch, in]`) y
+`TransformerBlock` (entrada `[batch, seq, model_dim]`), consulta los
+[ejemplos Python](python/README.md#ejemplos).
+
 ## 8. Wrapper estilo scikit-learn
 
 TensorCClassifier ofrece fit, predict, predict_proba, score, get_params,
@@ -217,7 +264,8 @@ network = tensorc.Sequential([
 ])
 clf = tensorc.TensorCClassifier(
     model=network,
-    epochs=300, batch_size=4,
+    epochs=300,
+    batch_size=4,
     learning_rate=0.05,
     random_state=42, verbose=False,
 )
@@ -227,17 +275,54 @@ print("predicciones:", clf.predict(X))
 print("probabilidades:", clf.predict_proba(X))
 print("exactitud:", clf.score(X, y))
 clf.save("clasificador.tck")
+
+# Recarga en otro proceso: reconstruye la misma arquitectura.
+network2 = tensorc.Sequential([
+    tensorc.DenseLayer(2, 8, seed=7),
+    tensorc.ReLULayer(),
+    tensorc.DenseLayer(8, 2, seed=8),
+])
+clf2 = tensorc.TensorCClassifier(model=network2, verbose=False)
+clf2.load_weights("clasificador.tck")
+print("exactitud recargada:", clf2.score(X, y))
 ~~~
 
 Con `model=Sequential(...)`, el forward, la pérdida, el entrenamiento por
 lotes y la predicción se ejecutan en C. La forma anterior con `forward` y
 `params` sigue disponible para modelos personalizados y conserva su bucle de
-entrenamiento en Python.
+entrenamiento en Python:
+
+~~~python
+import numpy as np
+import tensorc
+
+X_train = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.float32)
+y_train = np.array([0, 1, 1, 1])
+layer = tensorc.DenseLayer(2, 2, seed=7)
+clf = tensorc.TensorCClassifier(
+    forward=lambda x: layer.forward(x),
+    params=[layer.weight, layer.bias],
+    epochs=100,
+    batch_size=32,
+    learning_rate=0.001,
+)
+clf.fit(X_train, y_train)
+~~~
 
 ## 9. MNIST completo
 
-El ejemplo lee MNIST desde el archivo `.npz` en la caché de Keras; no importa
-TensorFlow. NumPy solo abre el archivo. `preprocess_mnist_images` convierte
+El ejemplo lee MNIST desde `~/.keras/datasets/mnist.npz`; no requiere Keras ni
+TensorFlow. Descarga el archivo de datos con:
+
+~~~bash
+mkdir -p ~/.keras/datasets
+curl -L https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz \
+  -o ~/.keras/datasets/mnist.npz
+~~~
+
+El archivo contiene 60,000 imágenes de entrenamiento y 10,000 de prueba; la
+[documentación de Keras MNIST](https://keras.io/api/datasets/mnist/) describe
+su formato. NumPy solo abre el archivo. `preprocess_mnist_images` convierte
 las imágenes uint8 a float32, normaliza sus valores y agrega el canal en C.
 El entrenamiento y la inferencia de `Sequential` también se ejecutan en C.
 
@@ -292,8 +377,8 @@ print("Exactitud:", clf.score(X_test, y_test))
 clf.save("mnist_tensorc.tck")
 ~~~
 
-En una prueba de referencia, 60,000 imágenes y 5 épocas tardaron
-aproximadamente 94 segundos en un Mac ARM.
+En una prueba de referencia, 60,000 imágenes y 5 épocas tardaron 93.63 segundos
+en un Mac ARM. El tiempo varía según el equipo y los parámetros.
 
 ## 10. Clasificador de lugares para estudiar
 
@@ -308,6 +393,11 @@ python experiments/study_classifier/train_study_classifier.py \
   --batch-size 16
 ~~~
 
+El script divide las filas etiquetadas en entrenamiento, validación y prueba;
+las filas `incierto` se predicen aparte. En el directorio de salida guarda el
+mejor checkpoint, el historial de épocas, las métricas de prueba y ambos
+archivos de predicciones.
+
 La arquitectura es:
 
 ~~~text
@@ -315,6 +405,11 @@ imagen: Conv2D -> ReLU -> MaxPool -> Conv2D -> ReLU -> MaxPool -> Dense
 metadatos: Dense
 fusión: concatenación -> Dense(2)
 ~~~
+
+Este entrenamiento multimodal usa el núcleo TensorC en C. Para el ejemplo
+supervisado clásico en Python/scikit-learn, abre
+[train_study_classifier_classic.ipynb](experiments/study_classifier/train_study_classifier_classic.ipynb);
+extrae características HOG y color, añade metadatos y guarda un modelo `.joblib`.
 
 ## 11. Guardar y cargar pesos
 
@@ -329,7 +424,9 @@ restored = tensorc.load("tensor.tcb", requires_grad=True)
 ~~~
 
 Para cargar un modelo se debe reconstruir la misma arquitectura. TensorC
-valida el número de tensores y sus formas antes de copiarlos.
+valida el número de tensores y sus formas antes de copiarlos. `Model` usa
+`save_weights` y `load_weights`; `TensorCClassifier.save` guarda además las
+clases y metadatos del estimador en un archivo `.json` contiguo.
 
 ## 12. Compilar y usar TensorC desde C11
 
@@ -392,24 +489,6 @@ En VS Code selecciona el mismo intérprete:
 Cmd + Shift + P -> Python: Select Interpreter -> .venv/bin/python
 ~~~
 
-### Error _ARRAY_API not found con TensorFlow
-
-TensorFlow fue compilado para NumPy 1.x y el entorno tiene NumPy 2.x. Usa un
-entorno limpio:
-
-~~~bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install "numpy<2" tensorflow tensorc
-~~~
-
-Comprueba las versiones:
-
-~~~bash
-python -c "import numpy, tensorflow, tensorc; print(numpy.__version__, tensorflow.__version__, tensorc.__version__)"
-~~~
-
 ### No aparece salida
 
 ~~~bash
@@ -457,7 +536,9 @@ print(f"Entrenamiento: {elapsed:.3f} segundos")
 Separa carga, preparación, entrenamiento, evaluación y guardado. La descarga
 inicial de MNIST no representa el tiempo de entrenamiento.
 
-## DQN en C11
+## 15. Aprendizaje por refuerzo
+
+### API DQN en C11
 
 TensorC incluye una API C experimental de DQN para observaciones vectoriales y
 acciones discretas. El agente ofrece una MLP densa, replay uniforme, red
@@ -500,7 +581,8 @@ cmake --build build --target tensorc_dqn_cartpole
 ./build/tensorc_dqn_cartpole
 ~~~
 
-La API no cubre acciones continuas ni PPO/actor-critic. El ejemplo reporta
+La API C no cubre acciones continuas ni PPO/actor-critic. El ejemplo implementa
+CartPole dentro del mismo archivo C11, sin instalar Gymnasium, y reporta
 recompensa media y tiempo de entrenamiento.
 
 ### Ejemplo con lugares y fotos
@@ -548,12 +630,65 @@ despejada, 32 °C, cero personas y −22 dBFS:
 
 El DQN devuelve la acción `apto`/`no_apto`, no una probabilidad calibrada.
 
-### Implementación Python/NumPy
+### Agente DQN en Python/NumPy
 
-`tensorc.DQNAgent` ofrece la misma interfaz básica para observaciones vectoriales
-y acciones discretas, implementada en Python/NumPy. El ejemplo
-`experiments/study_classifier/dqn_study_bandit_python.py` lee el ZIP directamente
-y extrae HOG, color y 11 metadatos en Python, sin usar CNN/DQN C:
+`tensorc.DQNAgent` acepta observaciones vectoriales y acciones discretas. El
+agente y sus cálculos corren en Python/NumPy; no requiere TensorFlow ni
+Gymnasium. Para conectarlo a un entorno Gymnasium existente, instala esa
+dependencia opcional:
+
+~~~bash
+python -m pip install "gymnasium[classic-control]"
+~~~
+
+Ejemplo con CartPole:
+
+~~~python
+import gymnasium as gym
+import tensorc
+
+env = gym.make("CartPole-v1")
+agent = tensorc.DQNAgent(
+    observation_size=4,
+    action_count=2,
+    hidden_size=64,
+    replay_capacity=10_000,
+    batch_size=64,
+    target_update_interval=250,
+    learning_rate=0.001,
+    discount_factor=0.99,
+    seed=42,
+)
+
+for episode in range(200):
+    state, _ = env.reset(seed=42 + episode)
+    epsilon = max(0.05, 1.0 - episode / 200)
+    finished = False
+    while not finished:
+        action = agent.select_action(state, epsilon=epsilon)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        agent.remember(
+            state, action, reward, next_state,
+            terminated=terminated, truncated=truncated,
+        )
+        loss = agent.train_step()  # None durante el warm-up del replay
+        state = next_state
+        finished = terminated or truncated
+
+env.close()
+agent.save("cartpole_policy.npz")
+agent_cargado = tensorc.DQNAgent.load("cartpole_policy.npz")
+~~~
+
+`terminated=True` detiene el bootstrap; `truncated=True` cierra el episodio,
+pero conserva el bootstrap. `save` guarda pesos de inferencia, no el replay ni
+el estado de Adam; cargarlo no reanuda la sesión de entrenamiento. La API
+Python no incluye acciones continuas ni una clase de entorno.
+
+### Bandit contextual con el ZIP de lugares
+
+`experiments/study_classifier/dqn_study_bandit_python.py` lee el ZIP y extrae
+HOG, color y 11 metadatos en Python; no usa el CNN ni el DQN C:
 
 ~~~bash
 PYTHONPATH=python python experiments/study_classifier/dqn_study_bandit_python.py \
@@ -566,7 +701,7 @@ Guarda `policy.npz`, métricas y predicciones en `results/python_dqn/`. Al ser
 una decisión de un paso entrenada con las etiquetas del ZIP, es un ejemplo de
 contextual bandit, no evidencia de aprendizaje de una política interactiva.
 
-## 15. Enlaces
+## 16. Enlaces
 
 - [Repositorio TensorC](https://github.com/CarlosGuedea/TensorC)
 - [TensorC en PyPI](https://pypi.org/project/tensorc/)

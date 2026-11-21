@@ -1,6 +1,6 @@
 # tensorc
 
-Consulta la [guía detallada de uso](../GUIA_USO.md) para instalación,
+Consulta el [manual de uso](../GUIA_USO.md) para instalación,
 entrenamiento, CNN, MNIST, C11, el wrapper estilo scikit-learn y solución de
 errores frecuentes.
 

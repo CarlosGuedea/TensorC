@@ -8,7 +8,7 @@ version = "0.16.0"
 description = "Neural network framework in C11 with autograd, callable from Python"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.20"]
+dependencies = ["numpy>=1.20,<2.3"]
 license = { text = "Apache-2.0" }
 authors = [{ name = "Carlos Guedea" }]
 keywords = ["neural-network", "autograd", "conv2d", "c11"]

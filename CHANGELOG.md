@@ -4,6 +4,7 @@
 
 - Nuevo backend opcional Apple Metal para operaciones de tensores en macOS; las operaciones no soportadas siguen en CPU y `tensorc.metal_available()` indica si se activó.
 - CMake y la extensión CPython pueden compilar Metal; las ruedas Apple Silicon de PyPI se construyen con este backend, mientras Intel macOS, Linux y Windows conservan sus rutas CPU/CUDA.
+- El paquete limita NumPy a `<2.3` para mantener ruedas compatibles con manylinux2014.
 - La medición inicial de MNIST no mostró una aceleración de entrenamiento significativa frente a CPU; no se prometen mejoras de rendimiento hasta optimizar esa ruta.
 - Flujo de publicación PyPI preparado para Trusted Publishing y sin token API persistente en GitHub Actions.
 

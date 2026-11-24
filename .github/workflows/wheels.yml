@@ -49,6 +49,7 @@ jobs:
           package-dir: python
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_ENVIRONMENT_MACOS: "TENSORC_METAL=1"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
@@ -58,6 +59,9 @@ jobs:
     needs: [sdist, wheels]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     environment:
       name: pypi
     steps:
@@ -67,8 +71,4 @@ jobs:
           merge-multiple: true
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
-          # No falla si algún archivo ya existe (p. ej. la rueda macOS
-          # subida a mano antes de tener este flujo).
-          skip-existing: true
+        # Uses PyPI Trusted Publishing; no long-lived API token is stored here.

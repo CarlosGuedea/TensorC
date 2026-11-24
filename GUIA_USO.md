@@ -92,6 +92,22 @@ python -m pip install "git+https://github.com/CarlosGuedea/TensorC.git@main#subd
 Para desarrollar desde un clon, ejecuta `python -m pip install -e ./python`
 desde la raíz del repositorio.
 
+### Backend Metal opcional (macOS Apple Silicon)
+
+La rueda normal de PyPI usa CPU. Para compilar la extensión local con Metal,
+desde la raíz del clon y con el entorno virtual activado:
+
+~~~bash
+TENSORC_METAL=1 python -m pip install --no-build-isolation --no-deps \
+  --force-reinstall ./python
+python -c "import tensorc; print('Metal:', tensorc.metal_available())"
+~~~
+
+Requiere macOS y Xcode. Metal acelera algunas operaciones de CNN; el resto
+usa CPU. El backend está en etapa inicial y todavía no garantiza acelerar el
+entrenamiento completo: en una prueba MNIST de 8,192 imágenes por 4 épocas,
+Metal y CPU tardaron cerca de 47 s. No hace falta TensorFlow ni PyTorch.
+
 ## 3. Verificar la instalación
 
 ~~~bash
@@ -101,7 +117,7 @@ python -c "import tensorc; print(tensorc.__version__)"
 La versión esperada es:
 
 ~~~text
-0.15.0
+0.16.0
 ~~~
 
 Prueba también una operación con autodiferenciación:

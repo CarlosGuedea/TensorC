@@ -11,9 +11,9 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
 #include <limits.h>
-#include "tensorc_cuda_internal.h"
+#include "tensorc_device_internal.h"
 #endif
 
 typedef enum {
@@ -64,7 +64,7 @@ struct tc_tensor_nd {
     /* Permutación de ejes para TC_ND_OP_PERMUTE (perm[i] = eje de la
      * entrada que va a la posición i de la salida). */
     size_t perm[8];
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Copias perezosas en GPU con flags de validez por copia. Invariante:
      * al menos una copia (host o device) es válida en todo momento. Las
      * rutas CUDA escriben en device y marcan la copia host como obsoleta;
@@ -118,7 +118,7 @@ static tc_tensor_nd *tensor_alloc(const size_t *shape, size_t ndim,
     tensor->refcount = 1;
     tensor->requires_grad = requires_grad != 0;
     tensor->op = TC_ND_OP_LEAF;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* calloc deja los punteros de device en NULL y sus flags en 0. */
     tensor->host_data_valid = 1;
     tensor->host_grad_valid = 1;
@@ -165,30 +165,30 @@ void tc_tensor_nd_free(tc_tensor_nd *tensor) {
     free(tensor->strides);
     free(tensor->data);
     free(tensor->grad);
-#ifdef TENSORC_HAS_CUDA
-    tc__cuda_free(tensor->dev_data, tensor->size);
-    tc__cuda_free(tensor->dev_grad, tensor->size);
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    tc__device_free(tensor->dev_data, tensor->size);
+    tc__device_free(tensor->dev_grad, tensor->size);
 #endif
     free(tensor);
 }
 
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
 /*
  * Sincronización perezosa host↔device. Convención:
- *  - nd_cuda_host_*: garantiza que la copia host está al día (baja de
+ *  - nd_device_host_*: garantiza que la copia host está al día (baja de
  *    device solo si la marca host está obsoleta).
- *  - nd_cuda_dev_*:  garantiza buffer de device con contenido al día
+ *  - nd_device_dev_*:  garantiza buffer de device con contenido al día
  *    (sube de host solo si la marca device está obsoleta); 0 en fallo.
- *  - nd_cuda_produced_*: marca que un kernel dejó la copia device al día.
+ *  - nd_device_produced_*: marca que un kernel dejó la copia device al día.
  * Cualquier fallo devuelve 0 y el llamador cae al camino genérico con el
  * estado consistente (las copias host de las entradas nunca se invalidan
  * antes de intentar la ruta CUDA).
  */
-static void nd_cuda_host_data(const tc_tensor_nd *tensor) {
+static void nd_device_host_data(const tc_tensor_nd *tensor) {
     tc_tensor_nd *t = (tc_tensor_nd *)tensor;
     if (!t || t->host_data_valid) return;
     if (t->dev_data &&
-        tc__cuda_copy_d2h(t->data, t->dev_data, t->size)) {
+        tc__device_copy_d2h(t->data, t->dev_data, t->size)) {
         t->host_data_valid = 1;
         return;
     }
@@ -201,11 +201,11 @@ static void nd_cuda_host_data(const tc_tensor_nd *tensor) {
     abort();
 }
 
-static void nd_cuda_host_grad(const tc_tensor_nd *tensor) {
+static void nd_device_host_grad(const tc_tensor_nd *tensor) {
     tc_tensor_nd *t = (tc_tensor_nd *)tensor;
     if (!t || !t->grad || t->host_grad_valid) return;
     if (t->dev_grad &&
-        tc__cuda_copy_d2h(t->grad, t->dev_grad, t->size)) {
+        tc__device_copy_d2h(t->grad, t->dev_grad, t->size)) {
         t->host_grad_valid = 1;
         return;
     }
@@ -214,58 +214,58 @@ static void nd_cuda_host_grad(const tc_tensor_nd *tensor) {
     abort();
 }
 
-static int nd_cuda_dev_data(tc_tensor_nd *tensor) {
+static int nd_device_dev_data(tc_tensor_nd *tensor) {
     if (tensor->dev_data_valid && !tensor->host_data_exposed) return 1;
     if (!tensor->dev_data) {
-        tensor->dev_data = tc__cuda_alloc(tensor->size);
+        tensor->dev_data = tc__device_alloc(tensor->size);
         if (!tensor->dev_data) return 0;
     }
     if (tensor->host_data_valid &&
-        !tc__cuda_copy_h2d(tensor->dev_data, tensor->data, tensor->size))
+        !tc__device_copy_h2d(tensor->dev_data, tensor->data, tensor->size))
         return 0;
     tensor->dev_data_valid = 1;
     return 1;
 }
 
-static int nd_cuda_dev_grad(tc_tensor_nd *tensor) {
+static int nd_device_dev_grad(tc_tensor_nd *tensor) {
     if (!tensor->grad) return 0;
     if (tensor->dev_grad_valid) return 1;
     if (!tensor->dev_grad) {
-        tensor->dev_grad = tc__cuda_alloc(tensor->size);
+        tensor->dev_grad = tc__device_alloc(tensor->size);
         if (!tensor->dev_grad) return 0;
     }
     if (tensor->host_grad_valid &&
-        !tc__cuda_copy_h2d(tensor->dev_grad, tensor->grad, tensor->size))
+        !tc__device_copy_h2d(tensor->dev_grad, tensor->grad, tensor->size))
         return 0;
     tensor->dev_grad_valid = 1;
     return 1;
 }
 
 /* Solo reserva el buffer de salida: el kernel sobrescribe cada elemento. */
-static int nd_cuda_dev_alloc_data(tc_tensor_nd *tensor) {
+static int nd_device_dev_alloc_data(tc_tensor_nd *tensor) {
     if (!tensor->dev_data) {
-        tensor->dev_data = tc__cuda_alloc(tensor->size);
+        tensor->dev_data = tc__device_alloc(tensor->size);
         if (!tensor->dev_data) return 0;
     }
     return 1;
 }
 
-static void nd_cuda_produced_data(tc_tensor_nd *tensor) {
+static void nd_device_produced_data(tc_tensor_nd *tensor) {
     tensor->dev_data_valid = 1;
     tensor->host_data_valid = 0;
 }
 
-static void nd_cuda_produced_grad(tc_tensor_nd *tensor) {
+static void nd_device_produced_grad(tc_tensor_nd *tensor) {
     tensor->dev_grad_valid = 1;
     tensor->host_grad_valid = 0;
 }
 
-/* Descriptor de broadcasting para los kernels (límite TC_CUDA_MAX_DIMS). */
-static int nd_cuda_broadcast_desc(const tc_tensor_nd *a, const tc_tensor_nd *b,
+/* Descriptor de broadcasting para los kernels (límite TC_DEVICE_MAX_DIMS). */
+static int nd_device_broadcast_desc(const tc_tensor_nd *a, const tc_tensor_nd *b,
                                   const tc_tensor_nd *out,
-                                  tc_cuda_broadcast_desc *desc) {
-    if (a->ndim > TC_CUDA_MAX_DIMS || b->ndim > TC_CUDA_MAX_DIMS ||
-        out->ndim > TC_CUDA_MAX_DIMS)
+                                  tc_device_broadcast_desc *desc) {
+    if (a->ndim > TC_DEVICE_MAX_DIMS || b->ndim > TC_DEVICE_MAX_DIMS ||
+        out->ndim > TC_DEVICE_MAX_DIMS)
         return 0;
     memset(desc, 0, sizeof(*desc));
     desc->ndim = (int)out->ndim;
@@ -288,10 +288,10 @@ static int nd_cuda_broadcast_desc(const tc_tensor_nd *a, const tc_tensor_nd *b,
 
 /* Descriptor de permutación para los kernels (transpose se expresa como
  * axes = {1, 0}). */
-static int nd_cuda_permute_desc(const tc_tensor_nd *in,
+static int nd_device_permute_desc(const tc_tensor_nd *in,
                                 const tc_tensor_nd *out, const size_t *axes,
-                                tc_cuda_permute_desc *desc) {
-    if (in->ndim > TC_CUDA_MAX_DIMS || out->ndim > TC_CUDA_MAX_DIMS)
+                                tc_device_permute_desc *desc) {
+    if (in->ndim > TC_DEVICE_MAX_DIMS || out->ndim > TC_DEVICE_MAX_DIMS)
         return 0;
     memset(desc, 0, sizeof(*desc));
     desc->ndim = (int)in->ndim;
@@ -311,12 +311,12 @@ static int nd_cuda_permute_desc(const tc_tensor_nd *in,
  * el bloque Transformer). En el backward la residencia se mide sobre el
  * gradiente del nodo de salida.
  */
-#define ND_CUDA_RESIDENT(t) \
-    ((t)->size >= tc__cuda_min_elems() || (t)->dev_data_valid)
-#define ND_CUDA_RESIDENT_GRAD(t) \
-    ((t)->size >= tc__cuda_min_elems() || (t)->dev_grad_valid)
+#define ND_DEVICE_RESIDENT(t) \
+    ((t)->size >= tc__device_min_elems() || (t)->dev_data_valid)
+#define ND_DEVICE_RESIDENT_GRAD(t) \
+    ((t)->size >= tc__device_min_elems() || (t)->dev_grad_valid)
 
-#define ND_SYNC_DATA(t) nd_cuda_host_data(t)
+#define ND_SYNC_DATA(t) nd_device_host_data(t)
 #else
 #define ND_SYNC_DATA(t) ((void)0)
 #endif
@@ -335,8 +335,8 @@ const size_t *tc_tensor_nd_shape(const tc_tensor_nd *tensor) {
 
 float *tc_tensor_nd_data(tc_tensor_nd *tensor) {
     if (!tensor) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    nd_cuda_host_data(tensor);
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    nd_device_host_data(tensor);
     /* Puntero mutable: el llamador puede escribir ahora y DESPUÉS a través
      * del mismo puntero. La copia de device queda obsoleta y marcada como
      * expuesta: cada subida posterior relee el host por seguridad. */
@@ -348,16 +348,16 @@ float *tc_tensor_nd_data(tc_tensor_nd *tensor) {
 
 const float *tc_tensor_nd_const_data(const tc_tensor_nd *tensor) {
     if (!tensor) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    nd_cuda_host_data(tensor);
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    nd_device_host_data(tensor);
 #endif
     return tensor->data;
 }
 
 const float *tc_tensor_nd_grad(const tc_tensor_nd *tensor) {
     if (!tensor) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    nd_cuda_host_grad(tensor);
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    nd_device_host_grad(tensor);
 #endif
     return tensor->grad;
 }
@@ -368,18 +368,18 @@ int tc_tensor_nd_requires_grad(const tc_tensor_nd *tensor) {
 
 void tc_tensor_nd_zero_grad(tc_tensor_nd *tensor) {
     if (tensor && tensor->grad) {
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         /* Si el gradiente ya tiene buffer de device, se pone a cero ahí
          * mismo y la copia host queda obsoleta (evita subir ceros). */
-        if (tensor->dev_grad && tc_cuda_available() &&
-            tc__cuda_zero_fill(tensor->dev_grad, tensor->size)) {
+        if (tensor->dev_grad && tc__device_available() &&
+            tc__device_zero_fill(tensor->dev_grad, tensor->size)) {
             tensor->dev_grad_valid = 1;
             tensor->host_grad_valid = 0;
             return;
         }
 #endif
         memset(tensor->grad, 0, tensor->size * sizeof(float));
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         tensor->host_grad_valid = 1;
         tensor->dev_grad_valid = 0;
 #endif
@@ -392,7 +392,7 @@ int tc_tensor_nd_copy_(tc_tensor_nd *dst, const tc_tensor_nd *src) {
         if (dst->shape[i] != src->shape[i]) return 0;
     ND_SYNC_DATA(src);
     memcpy(dst->data, src->data, src->size * sizeof(float));
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     dst->host_data_valid = 1;
     dst->dev_data_valid = 0;
 #endif
@@ -544,17 +544,17 @@ tc_tensor_nd *tc_tensor_nd_add(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() &&
-        (ND_CUDA_RESIDENT(a) || ND_CUDA_RESIDENT(b))) {
-        tc_cuda_broadcast_desc desc;
-        if (nd_cuda_broadcast_desc(a, b, result, &desc) &&
-            nd_cuda_dev_data((tc_tensor_nd *)a) &&
-            nd_cuda_dev_data((tc_tensor_nd *)b) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_add_forward(a->dev_data, b->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() &&
+        (ND_DEVICE_RESIDENT(a) || ND_DEVICE_RESIDENT(b))) {
+        tc_device_broadcast_desc desc;
+        if (nd_device_broadcast_desc(a, b, result, &desc) &&
+            nd_device_dev_data((tc_tensor_nd *)a) &&
+            nd_device_dev_data((tc_tensor_nd *)b) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_add_forward(a->dev_data, b->dev_data, result->dev_data,
                                  result->size, &desc)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -586,17 +586,17 @@ tc_tensor_nd *tc_tensor_nd_mul(const tc_tensor_nd *a, const tc_tensor_nd *b) {
                                             a, b);
     free(shape);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() &&
-        (ND_CUDA_RESIDENT(a) || ND_CUDA_RESIDENT(b))) {
-        tc_cuda_broadcast_desc desc;
-        if (nd_cuda_broadcast_desc(a, b, result, &desc) &&
-            nd_cuda_dev_data((tc_tensor_nd *)a) &&
-            nd_cuda_dev_data((tc_tensor_nd *)b) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_mul_forward(a->dev_data, b->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() &&
+        (ND_DEVICE_RESIDENT(a) || ND_DEVICE_RESIDENT(b))) {
+        tc_device_broadcast_desc desc;
+        if (nd_device_broadcast_desc(a, b, result, &desc) &&
+            nd_device_dev_data((tc_tensor_nd *)a) &&
+            nd_device_dev_data((tc_tensor_nd *)b) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_mul_forward(a->dev_data, b->dev_data, result->dev_data,
                                  result->size, &desc)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -626,22 +626,22 @@ tc_tensor_nd *tc_tensor_nd_matmul(const tc_tensor_nd *a, const tc_tensor_nd *b) 
     tc_tensor_nd *result = binary_result(shape, 2, TC_ND_OP_MATMUL,
                                             a, b);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Ruta rápida GPU: cuBLAS con el mismo criterio de tamaño que
      * Accelerate. El resultado queda residente en device. */
     {
         const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
-        if (tc_cuda_available() &&
+        if (tc__device_available() &&
             m <= (size_t)INT_MAX && k <= (size_t)INT_MAX &&
             n <= (size_t)INT_MAX && m > 0 && k > 0 && n > 0 &&
             m <= ((size_t)-1) / n && k <= ((size_t)-1) / n &&
-            m * n * k >= tc__cuda_min_gemm_work() &&
-            nd_cuda_dev_data((tc_tensor_nd *)a) &&
-            nd_cuda_dev_data((tc_tensor_nd *)b) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_matmul_nn(a->dev_data, b->dev_data, result->dev_data,
+            m * n * k >= tc__device_min_gemm_work() &&
+            nd_device_dev_data((tc_tensor_nd *)a) &&
+            nd_device_dev_data((tc_tensor_nd *)b) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_matmul_nn(a->dev_data, b->dev_data, result->dev_data,
                                m, k, n)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -834,6 +834,23 @@ tc_tensor_nd *tc_tensor_nd_conv2d_ex(const tc_tensor_nd *input,
     if (!result) return NULL;
     result->conv_options = options;
 
+#ifdef TENSORC_HAS_METAL
+    if (tc__device_available() &&
+        (result->size >= tc__device_min_elems() ||
+         ND_DEVICE_RESIDENT(input) || ND_DEVICE_RESIDENT(kernel)) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_data((tc_tensor_nd *)kernel) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_conv2d_forward(input->dev_data, kernel->dev_data,
+            result->dev_data, input->shape[0], input->shape[1],
+            input->shape[2], input->shape[3], kernel->shape[0],
+            kernel->shape[2], kernel->shape[3], output_height, output_width,
+            options.stride_h, options.stride_w, options.pad_h, options.pad_w)) {
+        nd_device_produced_data(result);
+        return result;
+    }
+#endif
+
 #ifdef TENSORC_HAS_ACCELERATE
     ND_SYNC_DATA(input);
     ND_SYNC_DATA(kernel);
@@ -851,13 +868,13 @@ tc_tensor_nd *tc_tensor_nd_relu(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(input->shape, input->ndim, TC_ND_OP_RELU,
                                             input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_relu_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_relu_forward(input->dev_data, result->dev_data,
                               input->size)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -873,13 +890,13 @@ tc_tensor_nd *tc_tensor_nd_sigmoid(const tc_tensor_nd *input) {
                                             TC_ND_OP_SIGMOID,
                                             input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_sigmoid_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_sigmoid_forward(input->dev_data, result->dev_data,
                                  input->size)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -900,13 +917,13 @@ tc_tensor_nd *tc_tensor_nd_tanh(const tc_tensor_nd *input) {
                                             TC_ND_OP_TANH,
                                             input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_tanh_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_tanh_forward(input->dev_data, result->dev_data,
                               input->size)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -923,15 +940,15 @@ tc_tensor_nd *tc_tensor_nd_softmax(const tc_tensor_nd *input) {
                                             TC_ND_OP_SOFTMAX,
                                             input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input)) {
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input)) {
         const size_t classes_ = input->shape[input->ndim - 1];
         const size_t rows_ = input->size / classes_;
-        if (nd_cuda_dev_data((tc_tensor_nd *)input) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_softmax_forward(input->dev_data, result->dev_data,
+        if (nd_device_dev_data((tc_tensor_nd *)input) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_softmax_forward(input->dev_data, result->dev_data,
                                      rows_, classes_)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -968,16 +985,16 @@ tc_tensor_nd *tc_tensor_nd_cross_entropy(const tc_tensor_nd *prediction,
                                             prediction,
                                             target);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Reducción en device: la loss nunca baja a host si no la leen. */
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(prediction) &&
-        nd_cuda_dev_data((tc_tensor_nd *)prediction) &&
-        nd_cuda_dev_data((tc_tensor_nd *)target) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_cross_entropy_forward(prediction->dev_data,
+    if (tc__device_available() && ND_DEVICE_RESIDENT(prediction) &&
+        nd_device_dev_data((tc_tensor_nd *)prediction) &&
+        nd_device_dev_data((tc_tensor_nd *)target) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_cross_entropy_forward(prediction->dev_data,
                                        target->dev_data, result->dev_data,
                                        prediction->size, rows)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1001,13 +1018,13 @@ tc_tensor_nd *tc_tensor_nd_reshape_to(const tc_tensor_nd *input,
     tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_RESHAPE,
                                             input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Copia device→device: el reshape no reordena datos. */
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_copy_d2d(result->dev_data, input->dev_data, input->size)) {
-        nd_cuda_produced_data(result);
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_copy_d2d(result->dev_data, input->dev_data, input->size)) {
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1028,6 +1045,18 @@ tc_tensor_nd *tc_tensor_nd_maxpool2d(const tc_tensor_nd *input,
     tc_tensor_nd *result = unary_result(output_shape, 4, TC_ND_OP_MAXPOOL2D,
                                             input);
     if (!result) return NULL;
+
+#ifdef TENSORC_HAS_METAL
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_maxpool2d_forward(input->dev_data, result->dev_data,
+            input->shape[0], input->shape[1], input->shape[2], input->shape[3],
+            pool_h, pool_w)) {
+        nd_device_produced_data(result);
+        return result;
+    }
+#endif
 
     ND_SYNC_DATA(input);
     const size_t batch = input->shape[0];
@@ -1221,13 +1250,13 @@ tc_tensor_nd *tc_tensor_nd_layer_norm(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                         TC_ND_OP_LAYERNORM, input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_layer_norm_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_layer_norm_forward(input->dev_data, result->dev_data,
                                     rows, width)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1263,13 +1292,13 @@ tc_tensor_nd *tc_tensor_nd_rms_norm(const tc_tensor_nd *input) {
     tc_tensor_nd *result = unary_result(input->shape, input->ndim,
                                         TC_ND_OP_RMSNORM, input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input) &&
-        nd_cuda_dev_data((tc_tensor_nd *)input) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_rms_norm_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input) &&
+        nd_device_dev_data((tc_tensor_nd *)input) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_rms_norm_forward(input->dev_data, result->dev_data,
                                   rows, width)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1294,17 +1323,17 @@ tc_tensor_nd *tc_tensor_nd_transpose(const tc_tensor_nd *input) {
     const size_t shape[] = {input->shape[1], input->shape[0]};
     tc_tensor_nd *result = unary_result(shape, 2, TC_ND_OP_TRANSPOSE, input);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Transpose 2D como permute de ejes {1, 0}. */
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input)) {
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input)) {
         const size_t axes2[] = {1, 0};
-        tc_cuda_permute_desc desc;
-        if (nd_cuda_permute_desc(input, result, axes2, &desc) &&
-            nd_cuda_dev_data((tc_tensor_nd *)input) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_permute_forward(input->dev_data, result->dev_data,
+        tc_device_permute_desc desc;
+        if (nd_device_permute_desc(input, result, axes2, &desc) &&
+            nd_device_dev_data((tc_tensor_nd *)input) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_permute_forward(input->dev_data, result->dev_data,
                                      input->size, &desc)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -1335,15 +1364,15 @@ tc_tensor_nd *tc_tensor_nd_permute(const tc_tensor_nd *input,
     tc_tensor_nd *result = unary_result(shape, ndim, TC_ND_OP_PERMUTE, input);
     if (!result) return NULL;
     for (size_t i = 0; i < ndim; ++i) result->perm[i] = axes[i];
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(input)) {
-        tc_cuda_permute_desc desc;
-        if (nd_cuda_permute_desc(input, result, axes, &desc) &&
-            nd_cuda_dev_data((tc_tensor_nd *)input) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_permute_forward(input->dev_data, result->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(input)) {
+        tc_device_permute_desc desc;
+        if (nd_device_permute_desc(input, result, axes, &desc) &&
+            nd_device_dev_data((tc_tensor_nd *)input) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_permute_forward(input->dev_data, result->dev_data,
                                      input->size, &desc)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -1396,24 +1425,24 @@ tc_tensor_nd *tc_tensor_nd_attention(const tc_tensor_nd *query,
     const size_t depth = query->shape[2];
     const size_t v_depth = value->shape[2];
     const float scale = 1.0f / sqrtf((float)depth);
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Ruta GPU: scores = scale·Q·Kᵀ y salida = P·V como GEMM batidas con
      * strides (cuBLAS) + softmax (causal opcional) en kernel propio. Va a
      * GPU si el volumen de scores supera el umbral o si las tres entradas
      * ya residen en device (típico dentro del bloque Transformer). */
-    if (tc_cuda_available() &&
-        (batch * q_seq * k_seq >= tc__cuda_min_elems() ||
+    if (tc__device_available() &&
+        (batch * q_seq * k_seq >= tc__device_min_elems() ||
          (query->dev_data_valid && key->dev_data_valid &&
           value->dev_data_valid))) {
-        if (nd_cuda_dev_data((tc_tensor_nd *)query) &&
-            nd_cuda_dev_data((tc_tensor_nd *)key) &&
-            nd_cuda_dev_data((tc_tensor_nd *)value) &&
-            nd_cuda_dev_alloc_data(result) &&
-            tc__cuda_attention_forward(
+        if (nd_device_dev_data((tc_tensor_nd *)query) &&
+            nd_device_dev_data((tc_tensor_nd *)key) &&
+            nd_device_dev_data((tc_tensor_nd *)value) &&
+            nd_device_dev_alloc_data(result) &&
+            tc__device_attention_forward(
                 query->dev_data, key->dev_data, value->dev_data,
                 result->dev_data, batch, q_seq, k_seq, depth, v_depth,
                 result->attn_causal)) {
-            nd_cuda_produced_data(result);
+            nd_device_produced_data(result);
             return result;
         }
     }
@@ -1490,14 +1519,14 @@ tc_tensor_nd *tc_tensor_nd_embedding(const tc_tensor_nd *table,
     tc_tensor_nd *result = binary_result(out_shape, ids->ndim + 1,
                                             TC_ND_OP_EMBEDDING, table, ids);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(table) &&
-        nd_cuda_dev_data((tc_tensor_nd *)table) &&
-        nd_cuda_dev_data((tc_tensor_nd *)ids) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_embedding_forward(table->dev_data, ids->dev_data,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && ND_DEVICE_RESIDENT(table) &&
+        nd_device_dev_data((tc_tensor_nd *)table) &&
+        nd_device_dev_data((tc_tensor_nd *)ids) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_embedding_forward(table->dev_data, ids->dev_data,
                                    result->dev_data, ids->size, dim)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1534,15 +1563,15 @@ tc_tensor_nd *tc_tensor_nd_cross_entropy_sparse(const tc_tensor_nd *prediction,
                                             TC_ND_OP_CROSS_ENTROPY_SPARSE,
                                             prediction, ids);
     if (!result) return NULL;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Reducción en device: la loss nunca baja a host si no la leen. */
-    if (tc_cuda_available() && ND_CUDA_RESIDENT(prediction) &&
-        nd_cuda_dev_data((tc_tensor_nd *)prediction) &&
-        nd_cuda_dev_data((tc_tensor_nd *)ids) &&
-        nd_cuda_dev_alloc_data(result) &&
-        tc__cuda_sparse_ce_forward(prediction->dev_data, ids->dev_data,
+    if (tc__device_available() && ND_DEVICE_RESIDENT(prediction) &&
+        nd_device_dev_data((tc_tensor_nd *)prediction) &&
+        nd_device_dev_data((tc_tensor_nd *)ids) &&
+        nd_device_dev_alloc_data(result) &&
+        tc__device_sparse_ce_forward(prediction->dev_data, ids->dev_data,
                                    result->dev_data, rows, classes)) {
-        nd_cuda_produced_data(result);
+        nd_device_produced_data(result);
         return result;
     }
 #endif
@@ -1687,17 +1716,17 @@ static int build_topology(tc_tensor_nd *tensor, tensor_list *list) {
 
 static void add_grad(tc_tensor_nd *tensor, size_t index, float value) {
     if (tensor && tensor->requires_grad && tensor->grad) {
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         /* El backward genérico escribe en host: sincroniza e invalida la
          * copia de device. */
-        nd_cuda_host_grad(tensor);
+        nd_device_host_grad(tensor);
         tensor->dev_grad_valid = 0;
 #endif
         tensor->grad[index] += value;
     }
 }
 
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
 /*
  * Dispatcher del backward en GPU. Devuelve 1 si procesó el nodo por
  * completo; 0 pide el camino genérico (ndtensor.c sincroniza a host antes
@@ -1709,35 +1738,75 @@ static void add_grad(tc_tensor_nd *tensor, size_t index, float value) {
  * con diagnóstico (fallo de driver/hardware; la alternativa sería
  * devolver gradientes corruptos en silencio).
  */
-static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
+static int nd_device_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
                                  tc_tensor_nd *b) {
-    if (!tc_cuda_available() || !tensor->grad) return 0;
+    if (!tc__device_available() || !tensor->grad) return 0;
     switch (tensor->op) {
+        case TC_ND_OP_CONV2D: {
+#ifdef TENSORC_HAS_METAL
+            const int want_x = a->requires_grad && a->grad;
+            const int want_w = b->requires_grad && b->grad;
+            if (!want_x && !want_w) return 1;
+            if (!nd_device_dev_data(a) || !nd_device_dev_data(b) ||
+                !nd_device_dev_grad(tensor) ||
+                (want_x && !nd_device_dev_grad(a)) ||
+                (want_w && !nd_device_dev_grad(b))) return 0;
+            const tc_conv2d_options o = tensor->conv_options;
+            if (!tc__device_conv2d_backward(a->dev_data, b->dev_data,
+                tensor->dev_grad, want_x ? a->dev_grad : NULL,
+                want_w ? b->dev_grad : NULL, a->shape[0], a->shape[1],
+                a->shape[2], a->shape[3], b->shape[0], b->shape[2],
+                b->shape[3], tensor->shape[2], tensor->shape[3],
+                o.stride_h, o.stride_w, o.pad_h, o.pad_w, want_x, want_w))
+                return 0;
+            if (want_x) nd_device_produced_grad(a);
+            if (want_w) nd_device_produced_grad(b);
+            return 1;
+#else
+            return 0;
+#endif
+        }
+        case TC_ND_OP_MAXPOOL2D: {
+#ifdef TENSORC_HAS_METAL
+            if (!a->requires_grad || !a->grad) return 1;
+            if (!nd_device_dev_data(a) || !nd_device_dev_grad(tensor) ||
+                !nd_device_dev_grad(a)) return 0;
+            const size_t ph = a->shape[2] / tensor->shape[2];
+            const size_t pw = a->shape[3] / tensor->shape[3];
+            if (!tc__device_maxpool2d_backward(a->dev_data,
+                tensor->dev_grad, a->dev_grad, a->shape[0], a->shape[1],
+                a->shape[2], a->shape[3], ph, pw)) return 0;
+            nd_device_produced_grad(a);
+            return 1;
+#else
+            return 0;
+#endif
+        }
         case TC_ND_OP_MATMUL: {
             const size_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
             if (m == 0 || k == 0 || n == 0 || m > (size_t)INT_MAX ||
                 k > (size_t)INT_MAX || n > (size_t)INT_MAX ||
                 m > ((size_t)-1) / n || k > ((size_t)-1) / n ||
-                m * n * k < tc__cuda_min_gemm_work())
+                m * n * k < tc__device_min_gemm_work())
                 return 0;
             const int want_a = a->requires_grad && a->grad;
             const int want_b = b->requires_grad && b->grad;
             if (!want_a && !want_b) return 1;
-            if (!nd_cuda_dev_grad(tensor)) return 0;
+            if (!nd_device_dev_grad(tensor)) return 0;
             if (want_a &&
-                (!nd_cuda_dev_data(b) || !nd_cuda_dev_grad(a)))
+                (!nd_device_dev_data(b) || !nd_device_dev_grad(a)))
                 return 0;
             if (want_b &&
-                (!nd_cuda_dev_data(a) || !nd_cuda_dev_grad(b)))
+                (!nd_device_dev_data(a) || !nd_device_dev_grad(b)))
                 return 0;
             if (want_a) {
-                if (!tc__cuda_matmul_nt(tensor->dev_grad, b->dev_data,
+                if (!tc__device_matmul_nt(tensor->dev_grad, b->dev_data,
                                         a->dev_grad, m, k, n))
                     return 0;
-                nd_cuda_produced_grad(a);
+                nd_device_produced_grad(a);
             }
             if (want_b) {
-                if (!tc__cuda_matmul_tn(a->dev_data, tensor->dev_grad,
+                if (!tc__device_matmul_tn(a->dev_data, tensor->dev_grad,
                                         b->dev_grad, m, k, n)) {
                     if (want_a) {
                         fprintf(stderr,
@@ -1748,166 +1817,166 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
                     }
                     return 0;
                 }
-                nd_cuda_produced_grad(b);
+                nd_device_produced_grad(b);
             }
             return 1;
         }
         case TC_ND_OP_ADD: {
-            if (tensor->size < tc__cuda_min_elems() &&
+            if (tensor->size < tc__device_min_elems() &&
                 !tensor->dev_grad_valid)
                 return 0;
-            tc_cuda_broadcast_desc desc;
-            if (!nd_cuda_broadcast_desc(a, b, tensor, &desc)) return 0;
+            tc_device_broadcast_desc desc;
+            if (!nd_device_broadcast_desc(a, b, tensor, &desc)) return 0;
             const int want_a = a->requires_grad && a->grad;
             const int want_b = b->requires_grad && b->grad;
             if (!want_a && !want_b) return 1;
-            if (!nd_cuda_dev_grad(tensor)) return 0;
-            if (want_a && !nd_cuda_dev_grad(a)) return 0;
-            if (want_b && !nd_cuda_dev_grad(b)) return 0;
-            if (!tc__cuda_add_backward(tensor->dev_grad,
+            if (!nd_device_dev_grad(tensor)) return 0;
+            if (want_a && !nd_device_dev_grad(a)) return 0;
+            if (want_b && !nd_device_dev_grad(b)) return 0;
+            if (!tc__device_add_backward(tensor->dev_grad,
                                        want_a ? a->dev_grad : NULL,
                                        want_b ? b->dev_grad : NULL,
                                        tensor->size, &desc, want_a, want_b))
                 return 0;
-            if (want_a) nd_cuda_produced_grad(a);
-            if (want_b) nd_cuda_produced_grad(b);
+            if (want_a) nd_device_produced_grad(a);
+            if (want_b) nd_device_produced_grad(b);
             return 1;
         }
         case TC_ND_OP_MUL: {
-            if (tensor->size < tc__cuda_min_elems() &&
+            if (tensor->size < tc__device_min_elems() &&
                 !tensor->dev_grad_valid)
                 return 0;
-            tc_cuda_broadcast_desc desc;
-            if (!nd_cuda_broadcast_desc(a, b, tensor, &desc)) return 0;
+            tc_device_broadcast_desc desc;
+            if (!nd_device_broadcast_desc(a, b, tensor, &desc)) return 0;
             const int want_a = a->requires_grad && a->grad;
             const int want_b = b->requires_grad && b->grad;
             if (!want_a && !want_b) return 1;
-            if (!nd_cuda_dev_grad(tensor)) return 0;
-            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b)) return 0;
-            if (want_a && !nd_cuda_dev_grad(a)) return 0;
-            if (want_b && !nd_cuda_dev_grad(b)) return 0;
-            if (!tc__cuda_mul_backward(tensor->dev_grad, a->dev_data,
+            if (!nd_device_dev_grad(tensor)) return 0;
+            if (!nd_device_dev_data(a) || !nd_device_dev_data(b)) return 0;
+            if (want_a && !nd_device_dev_grad(a)) return 0;
+            if (want_b && !nd_device_dev_grad(b)) return 0;
+            if (!tc__device_mul_backward(tensor->dev_grad, a->dev_data,
                                        b->dev_data,
                                        want_a ? a->dev_grad : NULL,
                                        want_b ? b->dev_grad : NULL,
                                        tensor->size, &desc, want_a, want_b))
                 return 0;
-            if (want_a) nd_cuda_produced_grad(a);
-            if (want_b) nd_cuda_produced_grad(b);
+            if (want_a) nd_device_produced_grad(a);
+            if (want_b) nd_device_produced_grad(b);
             return 1;
         }
         case TC_ND_OP_RELU: {
-            if ((a->size < tc__cuda_min_elems() &&
+            if ((a->size < tc__device_min_elems() &&
                  !tensor->dev_grad_valid) ||
                 !a->requires_grad || !a->grad)
                 return 0;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(a) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(a) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_relu_backward(a->dev_data, tensor->dev_grad,
+            if (!tc__device_relu_backward(a->dev_data, tensor->dev_grad,
                                         a->dev_grad, a->size))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_SIGMOID: {
-            if ((a->size < tc__cuda_min_elems() &&
+            if ((a->size < tc__device_min_elems() &&
                  !tensor->dev_grad_valid) ||
                 !a->requires_grad || !a->grad)
                 return 0;
             /* El backward usa la salida y = sigmoid(x), que es tensor. */
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(tensor) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_sigmoid_backward(tensor->dev_data,
+            if (!tc__device_sigmoid_backward(tensor->dev_data,
                                            tensor->dev_grad, a->dev_grad,
                                            a->size))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_TANH: {
-            if ((a->size < tc__cuda_min_elems() &&
+            if ((a->size < tc__device_min_elems() &&
                  !tensor->dev_grad_valid) ||
                 !a->requires_grad || !a->grad)
                 return 0;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(tensor) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_tanh_backward(tensor->dev_data, tensor->dev_grad,
+            if (!tc__device_tanh_backward(tensor->dev_data, tensor->dev_grad,
                                         a->dev_grad, a->size))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_SOFTMAX: {
-            if ((a->size < tc__cuda_min_elems() &&
+            if ((a->size < tc__device_min_elems() &&
                  !tensor->dev_grad_valid) ||
                 !a->requires_grad || !a->grad)
                 return 0;
             const size_t classes = a->shape[a->ndim - 1];
             const size_t rows = a->size / classes;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(tensor) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(tensor) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_softmax_backward(tensor->dev_data,
+            if (!tc__device_softmax_backward(tensor->dev_data,
                                            tensor->dev_grad, a->dev_grad,
                                            rows, classes))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_CROSS_ENTROPY: {
             const size_t classes = a->shape[a->ndim - 1];
             const size_t rows = a->size / classes;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const int want_a = a->requires_grad && a->grad;
             const int want_b = b->requires_grad && b->grad;
             if (!want_a && !want_b) return 1;
-            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b) ||
-                !nd_cuda_dev_grad(tensor))
+            if (!nd_device_dev_data(a) || !nd_device_dev_data(b) ||
+                !nd_device_dev_grad(tensor))
                 return 0;
-            if (want_a && !nd_cuda_dev_grad(a)) return 0;
-            if (want_b && !nd_cuda_dev_grad(b)) return 0;
-            if (!tc__cuda_cross_entropy_backward(
+            if (want_a && !nd_device_dev_grad(a)) return 0;
+            if (want_b && !nd_device_dev_grad(b)) return 0;
+            if (!tc__device_cross_entropy_backward(
                     a->dev_data, b->dev_data, tensor->dev_grad,
                     want_a ? a->dev_grad : NULL,
                     want_b ? b->dev_grad : NULL,
                     a->size, rows, want_a, want_b))
                 return 0;
-            if (want_a) nd_cuda_produced_grad(a);
-            if (want_b) nd_cuda_produced_grad(b);
+            if (want_a) nd_device_produced_grad(a);
+            if (want_b) nd_device_produced_grad(b);
             return 1;
         }
         case TC_ND_OP_LAYERNORM: {
             if (!a->requires_grad || !a->grad) return 1;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const size_t width = a->shape[a->ndim - 1];
             const size_t rows = a->size / width;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(a) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(a) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_layer_norm_backward(a->dev_data, tensor->dev_grad,
+            if (!tc__device_layer_norm_backward(a->dev_data, tensor->dev_grad,
                                               a->dev_grad, rows, width))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_RMSNORM: {
             if (!a->requires_grad || !a->grad) return 1;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const size_t width = a->shape[a->ndim - 1];
             const size_t rows = a->size / width;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(a) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(a) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_rms_norm_backward(a->dev_data, tensor->dev_grad,
+            if (!tc__device_rms_norm_backward(a->dev_data, tensor->dev_grad,
                                             a->dev_grad, rows, width))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_ATTENTION: {
@@ -1919,20 +1988,20 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
             const size_t k_seq = k->shape[1];
             const size_t depth = q->shape[2];
             const size_t v_depth = v->shape[2];
-            if (batch * q_seq * k_seq < tc__cuda_min_elems() &&
+            if (batch * q_seq * k_seq < tc__device_min_elems() &&
                 !tensor->dev_grad_valid)
                 return 0;
             const int want_q = q->requires_grad && q->grad;
             const int want_k = k->requires_grad && k->grad;
             const int want_v = v->requires_grad && v->grad;
             if (!want_q && !want_k && !want_v) return 1;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(q) ||
-                !nd_cuda_dev_data(k) || !nd_cuda_dev_data(v))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(q) ||
+                !nd_device_dev_data(k) || !nd_device_dev_data(v))
                 return 0;
-            if (want_q && !nd_cuda_dev_grad(q)) return 0;
-            if (want_k && !nd_cuda_dev_grad(k)) return 0;
-            if (want_v && !nd_cuda_dev_grad(v)) return 0;
-            if (!tc__cuda_attention_backward(
+            if (want_q && !nd_device_dev_grad(q)) return 0;
+            if (want_k && !nd_device_dev_grad(k)) return 0;
+            if (want_v && !nd_device_dev_grad(v)) return 0;
+            if (!tc__device_attention_backward(
                     q->dev_data, k->dev_data, v->dev_data, tensor->dev_grad,
                     want_q ? q->dev_grad : NULL,
                     want_k ? k->dev_grad : NULL,
@@ -1940,69 +2009,69 @@ static int nd_cuda_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
                     batch, q_seq, k_seq, depth, v_depth,
                     tensor->attn_causal))
                 return 0;
-            if (want_q) nd_cuda_produced_grad(q);
-            if (want_k) nd_cuda_produced_grad(k);
-            if (want_v) nd_cuda_produced_grad(v);
+            if (want_q) nd_device_produced_grad(q);
+            if (want_k) nd_device_produced_grad(k);
+            if (want_v) nd_device_produced_grad(v);
             return 1;
         }
         case TC_ND_OP_TRANSPOSE:
         case TC_ND_OP_PERMUTE: {
             if (!a->requires_grad || !a->grad) return 1;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const size_t transpose_axes[] = {1, 0};
             const size_t *axes = tensor->op == TC_ND_OP_PERMUTE
                                      ? tensor->perm
                                      : transpose_axes;
-            tc_cuda_permute_desc desc;
-            if (!nd_cuda_permute_desc(a, tensor, axes, &desc)) return 0;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_grad(a)) return 0;
-            if (!tc__cuda_permute_backward(tensor->dev_grad, a->dev_grad,
+            tc_device_permute_desc desc;
+            if (!nd_device_permute_desc(a, tensor, axes, &desc)) return 0;
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_grad(a)) return 0;
+            if (!tc__device_permute_backward(tensor->dev_grad, a->dev_grad,
                                            a->size, &desc))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_RESHAPE: {
             if (!a->requires_grad || !a->grad) return 1;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_grad(a)) return 0;
-            if (!tc__cuda_accumulate(a->dev_grad, tensor->dev_grad, a->size))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_grad(a)) return 0;
+            if (!tc__device_accumulate(a->dev_grad, tensor->dev_grad, a->size))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_EMBEDDING: {
             /* a = tabla [vocab, dim], b = ids (sin gradiente). */
             if (!a->requires_grad || !a->grad) return 1;
-            if (tensor->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (tensor->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const size_t dim = a->shape[1];
-            if (!nd_cuda_dev_grad(tensor) || !nd_cuda_dev_data(b) ||
-                !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_grad(tensor) || !nd_device_dev_data(b) ||
+                !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_embedding_backward(tensor->dev_grad, b->dev_data,
+            if (!tc__device_embedding_backward(tensor->dev_grad, b->dev_data,
                                              a->dev_grad, b->size, dim))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         case TC_ND_OP_CROSS_ENTROPY_SPARSE: {
             /* a = prediction [rows, classes], b = ids (sin gradiente). */
             if (!a->requires_grad || !a->grad) return 1;
-            if (a->size < tc__cuda_min_elems() && !tensor->dev_grad_valid)
+            if (a->size < tc__device_min_elems() && !tensor->dev_grad_valid)
                 return 0;
             const size_t classes = a->shape[a->ndim - 1];
             const size_t rows = a->size / classes;
-            if (!nd_cuda_dev_data(a) || !nd_cuda_dev_data(b) ||
-                !nd_cuda_dev_grad(tensor) || !nd_cuda_dev_grad(a))
+            if (!nd_device_dev_data(a) || !nd_device_dev_data(b) ||
+                !nd_device_dev_grad(tensor) || !nd_device_dev_grad(a))
                 return 0;
-            if (!tc__cuda_sparse_ce_backward(a->dev_data, b->dev_data,
+            if (!tc__device_sparse_ce_backward(a->dev_data, b->dev_data,
                                              tensor->dev_grad, a->dev_grad,
                                              rows, classes))
                 return 0;
-            nd_cuda_produced_grad(a);
+            nd_device_produced_grad(a);
             return 1;
         }
         default:
@@ -2015,15 +2084,15 @@ static void backward_node(tc_tensor_nd *tensor) {
     if (!tensor || !tensor->requires_grad || !tensor->grad) return;
     tc_tensor_nd *a = tensor->parent_count > 0 ? tensor->parents[0] : NULL;
     tc_tensor_nd *b = tensor->parent_count > 1 ? tensor->parents[1] : NULL;
-#ifdef TENSORC_HAS_CUDA
-    if (nd_cuda_backward_node(tensor, a, b)) return;
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (nd_device_backward_node(tensor, a, b)) return;
     /* Camino genérico: todas las copias que el switch lee o escribe deben
      * estar al día en host (data y grad del nodo y de cada padre). */
-    nd_cuda_host_grad(tensor);
-    nd_cuda_host_data(tensor);
+    nd_device_host_grad(tensor);
+    nd_device_host_data(tensor);
     for (size_t p = 0; p < tensor->parent_count; ++p) {
-        nd_cuda_host_data(tensor->parents[p]);
-        nd_cuda_host_grad(tensor->parents[p]);
+        nd_device_host_data(tensor->parents[p]);
+        nd_device_host_grad(tensor->parents[p]);
     }
 #endif
     switch (tensor->op) {
@@ -2567,7 +2636,7 @@ static void backward_node(tc_tensor_nd *tensor) {
         default:
             break;
     }
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* El backward genérico acumuló gradientes en host (la atención escribe
      * q/k/v->grad directamente, sin pasar por add_grad): las copias de
      * device de los padres quedan obsoletas. */
@@ -2586,7 +2655,7 @@ int tc_tensor_nd_backward(tc_tensor_nd *loss) {
     for (size_t i = 0; i < topology.count; ++i)
         if (topology.items[i]->requires_grad) tc_tensor_nd_zero_grad(topology.items[i]);
     loss->grad[0] = 1.0f;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* La semilla se escribe en host: esa copia manda sobre la de device
      * (zero_grad pudo haber dejado la copia de device como la válida). */
     loss->host_grad_valid = 1;
@@ -2613,20 +2682,20 @@ void tc_tensor_nd_print(const tc_tensor_nd *tensor, const char *name) {
 
 void tc_tensor_nd_sgd_step(tc_tensor_nd *param, float learning_rate) {
     if (!param || !param->grad) return;
-#ifdef TENSORC_HAS_CUDA
-    if (tc_cuda_available() && nd_cuda_dev_data(param) &&
-        nd_cuda_dev_grad(param) &&
-        tc__cuda_sgd_step(param->dev_data, param->dev_grad, param->size,
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (tc__device_available() && nd_device_dev_data(param) &&
+        nd_device_dev_grad(param) &&
+        tc__device_sgd_step(param->dev_data, param->dev_grad, param->size,
                           learning_rate)) {
-        nd_cuda_produced_data(param);
+        nd_device_produced_data(param);
         return;
     }
-    nd_cuda_host_data(param);
-    nd_cuda_host_grad(param);
+    nd_device_host_data(param);
+    nd_device_host_grad(param);
 #endif
     for (size_t i = 0; i < param->size; ++i)
         param->data[i] -= learning_rate * param->grad[i];
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     param->dev_data_valid = 0;
 #endif
 }
@@ -2768,7 +2837,7 @@ struct tc_tensor_nd_optimizer {
     size_t count;
     float learning_rate;
     unsigned long step_count;
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     /* Momentos residentes en device; mv_on_device[i]=1 significa que la
      * copia al día de m[i]/v[i] es la de device (la de host está obsoleta
      * y se resincroniza si un paso debe caer a CPU). */
@@ -2793,7 +2862,7 @@ tc_tensor_nd_optimizer *tc_tensor_nd_optimizer_adam(tc_tensor_nd **params,
         tc_tensor_nd_optimizer_free(optimizer);
         return NULL;
     }
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     optimizer->dev_m = (float **)calloc(count, sizeof(float *));
     optimizer->dev_v = (float **)calloc(count, sizeof(float *));
     optimizer->mv_on_device =
@@ -2832,29 +2901,29 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
         if (!param || !param->grad) continue;
         float *m = optimizer->m[i];
         float *v = optimizer->v[i];
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         /* Ruta GPU: los momentos viven en device junto al parámetro; el
          * host solo se resincroniza si hay que caer al camino de CPU. */
-        if (tc_cuda_available()) {
+        if (tc__device_available()) {
             if (!optimizer->dev_m[i]) {
-                optimizer->dev_m[i] = tc__cuda_alloc(param->size);
+                optimizer->dev_m[i] = tc__device_alloc(param->size);
                 if (optimizer->dev_m[i] &&
-                    !tc__cuda_copy_h2d(optimizer->dev_m[i], m, param->size)) {
-                    tc__cuda_free(optimizer->dev_m[i], param->size);
+                    !tc__device_copy_h2d(optimizer->dev_m[i], m, param->size)) {
+                    tc__device_free(optimizer->dev_m[i], param->size);
                     optimizer->dev_m[i] = NULL;
                 }
             }
             if (!optimizer->dev_v[i]) {
-                optimizer->dev_v[i] = tc__cuda_alloc(param->size);
+                optimizer->dev_v[i] = tc__device_alloc(param->size);
                 if (optimizer->dev_v[i] &&
-                    !tc__cuda_copy_h2d(optimizer->dev_v[i], v, param->size)) {
-                    tc__cuda_free(optimizer->dev_v[i], param->size);
+                    !tc__device_copy_h2d(optimizer->dev_v[i], v, param->size)) {
+                    tc__device_free(optimizer->dev_v[i], param->size);
                     optimizer->dev_v[i] = NULL;
                 }
             }
             if (optimizer->dev_m[i] && optimizer->dev_v[i] &&
-                nd_cuda_dev_data(param) && nd_cuda_dev_grad(param)) {
-                if (!tc__cuda_adam_step(
+                nd_device_dev_data(param) && nd_device_dev_grad(param)) {
+                if (!tc__device_adam_step(
                         param->dev_data, param->dev_grad,
                         optimizer->dev_m[i], optimizer->dev_v[i],
                         param->size, optimizer->learning_rate, beta1, beta2,
@@ -2865,7 +2934,7 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
                     abort();
                 }
                 optimizer->mv_on_device[i] = 1;
-                nd_cuda_produced_data(param);
+                nd_device_produced_data(param);
                 ++updated;
                 continue;
             }
@@ -2873,15 +2942,15 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
         if (optimizer->mv_on_device[i]) {
             /* Caída a CPU con momentos en device: bajarlos primero. */
             if (optimizer->dev_m[i] &&
-                !tc__cuda_copy_d2h(m, optimizer->dev_m[i], param->size))
+                !tc__device_copy_d2h(m, optimizer->dev_m[i], param->size))
                 abort();
             if (optimizer->dev_v[i] &&
-                !tc__cuda_copy_d2h(v, optimizer->dev_v[i], param->size))
+                !tc__device_copy_d2h(v, optimizer->dev_v[i], param->size))
                 abort();
             optimizer->mv_on_device[i] = 0;
         }
-        nd_cuda_host_data(param);
-        nd_cuda_host_grad(param);
+        nd_device_host_data(param);
+        nd_device_host_grad(param);
 #endif
         for (size_t j = 0; j < param->size; ++j) {
             const float grad = param->grad[j];
@@ -2892,7 +2961,7 @@ int tc_tensor_nd_optimizer_step(tc_tensor_nd_optimizer *optimizer) {
             param->data[j] -=
                 optimizer->learning_rate * m_hat / (sqrtf(v_hat) + epsilon);
         }
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         param->dev_data_valid = 0;
 #endif
         ++updated;
@@ -2910,14 +2979,14 @@ void tc_tensor_nd_optimizer_free(tc_tensor_nd_optimizer *optimizer) {
     for (size_t i = 0; i < optimizer->count; ++i) {
         free(optimizer->m ? optimizer->m[i] : NULL);
         free(optimizer->v ? optimizer->v[i] : NULL);
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
         const size_t psize =
             optimizer->params[i] ? optimizer->params[i]->size : 0;
-        tc__cuda_free(optimizer->dev_m ? optimizer->dev_m[i] : NULL, psize);
-        tc__cuda_free(optimizer->dev_v ? optimizer->dev_v[i] : NULL, psize);
+        tc__device_free(optimizer->dev_m ? optimizer->dev_m[i] : NULL, psize);
+        tc__device_free(optimizer->dev_v ? optimizer->dev_v[i] : NULL, psize);
 #endif
     }
-#ifdef TENSORC_HAS_CUDA
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
     free(optimizer->dev_m);
     free(optimizer->dev_v);
     free(optimizer->mv_on_device);
@@ -3533,4 +3602,8 @@ void tc_free_checkpoint(tc_tensor_nd **tensors, size_t count) {
 int tc_cuda_available(void) { return 0; }
 int tc_cuda_set_device(int device) { (void)device; return 0; }
 int tc_cuda_device(void) { return -1; }
+#endif
+
+#ifndef TENSORC_HAS_METAL
+int tc_metal_available(void) { return 0; }
 #endif

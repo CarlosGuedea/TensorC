@@ -790,6 +790,12 @@ static PyObject *module_cuda_available(PyObject *self, PyObject *args) {
     return PyBool_FromLong(tc_cuda_available());
 }
 
+static PyObject *module_metal_available(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyBool_FromLong(tc_metal_available());
+}
+
 static PyObject *module_cuda_set_device(PyObject *self, PyObject *args) {
     int device;
     (void)self;
@@ -865,6 +871,8 @@ static PyMethodDef module_methods[] = {
      "load(path, requires_grad=False) -> Tensor o lista de Tensors."},
     {"cuda_available", (PyCFunction)module_cuda_available, METH_NOARGS,
      "cuda_available() -> True si el paquete se compiló con backend CUDA y hay GPU."},
+    {"metal_available", (PyCFunction)module_metal_available, METH_NOARGS,
+     "metal_available() -> True si el paquete se compiló con backend Metal y hay GPU."},
     {"cuda_set_device", (PyCFunction)module_cuda_set_device, METH_VARARGS,
      "cuda_set_device(i) -> True si el dispositivo i quedó activo."},
     {"cuda_device", (PyCFunction)module_cuda_device, METH_NOARGS,

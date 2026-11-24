@@ -16,7 +16,7 @@
  * sale de un pool por tamaño exacto para evitar los cudaMalloc/cudaFree
  * sincronizantes en el bucle de entrenamiento.
  */
-#include "tensorc_cuda_internal.h"
+#include "tensorc_device_internal.h"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -31,8 +31,8 @@
 /* Estado del proceso: un solo dispositivo activo (v1).               */
 /* ------------------------------------------------------------------ */
 
-static int tc__cuda_state = 0; /* 0 = sin sondear, 1 = disponible, -1 = no */
-static int tc__cuda_current_device = 0;
+static int tc__device_state = 0; /* 0 = sin sondear, 1 = disponible, -1 = no */
+static int tc__device_current_device = 0;
 static cublasHandle_t tc__cublas_handle = NULL;
 static size_t tc__min_elems = (size_t)16384;
 
@@ -43,73 +43,75 @@ static size_t tc__min_elems = (size_t)16384;
  * botella). La reutilización inmediata es segura porque todo el trabajo
  * va al stream por defecto: lo nuevo se encola tras lo viejo. Los bloques
  * se liberan de verdad al cerrar el proceso. */
-typedef struct tc__cuda_block {
+typedef struct tc__device_block {
     float *ptr;
     size_t count;
-    struct tc__cuda_block *next;
-} tc__cuda_block;
+    struct tc__device_block *next;
+} tc__device_block;
 
-static tc__cuda_block *tc__cuda_pool = NULL;
+static tc__device_block *tc__device_pool = NULL;
 
-static void tc__cuda_shutdown(void) {
+static void tc__device_shutdown(void) {
     if (tc__cublas_handle) {
         cublasDestroy(tc__cublas_handle);
         tc__cublas_handle = NULL;
     }
-    while (tc__cuda_pool) {
-        tc__cuda_block *block = tc__cuda_pool;
-        tc__cuda_pool = block->next;
-        if (tc__cuda_state > 0) {
-            cudaSetDevice(tc__cuda_current_device);
+    while (tc__device_pool) {
+        tc__device_block *block = tc__device_pool;
+        tc__device_pool = block->next;
+        if (tc__device_state > 0) {
+            cudaSetDevice(tc__device_current_device);
             cudaFree(block->ptr);
         }
         free(block);
     }
 }
 
-static int tc__cuda_probe(void) {
-    if (tc__cuda_state != 0) return tc__cuda_state > 0;
+static int tc__device_probe(void) {
+    if (tc__device_state != 0) return tc__device_state > 0;
     int count = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
     /* cudaGetDeviceCount deja el flag de error prendido cuando no hay
      * driver; se limpia para no contaminar llamadas posteriores. */
     cudaGetLastError();
-    tc__cuda_state = (err == cudaSuccess && count > 0) ? 1 : -1;
-    if (tc__cuda_state > 0) {
+    tc__device_state = (err == cudaSuccess && count > 0) ? 1 : -1;
+    if (tc__device_state > 0) {
         const char *env = getenv("TC_CUDA_MIN_ELEMS");
         if (env && env[0])
             tc__min_elems = (size_t)strtoull(env, NULL, 10);
-        cudaSetDevice(tc__cuda_current_device);
-        atexit(tc__cuda_shutdown);
+        cudaSetDevice(tc__device_current_device);
+        atexit(tc__device_shutdown);
     }
-    return tc__cuda_state > 0;
+    return tc__device_state > 0;
 }
 
 int tc_cuda_available(void) {
-    return tc__cuda_probe();
+    return tc__device_probe();
 }
 
+int tc__device_available(void) { return tc_cuda_available(); }
+
 int tc_cuda_set_device(int device) {
-    if (!tc__cuda_probe()) return 0;
+    if (!tc__device_probe()) return 0;
     int count = 0;
     cudaGetDeviceCount(&count);
     if (device < 0 || device >= count) return 0;
     if (cudaSetDevice(device) != cudaSuccess) return 0;
-    tc__cuda_current_device = device;
+    tc__device_current_device = device;
     return 1;
 }
 
 int tc_cuda_device(void) {
-    return tc__cuda_probe() ? tc__cuda_current_device : -1;
+    return tc__device_probe() ? tc__device_current_device : -1;
 }
 
-size_t tc__cuda_min_elems(void) {
-    tc__cuda_probe();
+size_t tc__device_min_elems(void) {
+    tc__device_probe();
     return tc__min_elems;
 }
 
-size_t tc__cuda_min_gemm_work(void) {
-    tc__cuda_probe();
+size_t tc__device_min_gemm_work(void) {
+    tc__device_probe();
     return tc__min_elems < ((size_t)1 << 12) ? tc__min_elems
                                              : ((size_t)1 << 12);
 }
@@ -118,15 +120,15 @@ size_t tc__cuda_min_gemm_work(void) {
 /* Memoria y copias.                                                   */
 /* ------------------------------------------------------------------ */
 
-float *tc__cuda_alloc(size_t count) {
-    if (!tc__cuda_probe() || count == 0) return NULL;
-    cudaSetDevice(tc__cuda_current_device);
+float *tc__device_alloc(size_t count) {
+    if (!tc__device_probe() || count == 0) return NULL;
+    cudaSetDevice(tc__device_current_device);
     /* Reutiliza un bloque libre del tamaño exacto (búsqueda lineal: la
      * lista tiene una entrada por tamaño vivo, es corta). */
-    tc__cuda_block **link = &tc__cuda_pool;
+    tc__device_block **link = &tc__device_pool;
     while (*link) {
         if ((*link)->count == count) {
-            tc__cuda_block *block = *link;
+            tc__device_block *block = *link;
             *link = block->next;
             float *ptr = block->ptr;
             free(block);
@@ -142,34 +144,34 @@ float *tc__cuda_alloc(size_t count) {
     return (float *)ptr;
 }
 
-void tc__cuda_free(float *ptr, size_t count) {
-    if (!ptr || tc__cuda_state <= 0) return;
+void tc__device_free(float *ptr, size_t count) {
+    if (!ptr || tc__device_state <= 0) return;
     /* No toca el dispositivo: el bloque vuelve al pool para reutilizarse. */
-    tc__cuda_block *block = (tc__cuda_block *)malloc(sizeof(*block));
+    tc__device_block *block = (tc__device_block *)malloc(sizeof(*block));
     if (!block) {
-        cudaSetDevice(tc__cuda_current_device);
+        cudaSetDevice(tc__device_current_device);
         cudaFree(ptr);
         cudaGetLastError();
         return;
     }
     block->ptr = ptr;
     block->count = count;
-    block->next = tc__cuda_pool;
-    tc__cuda_pool = block;
+    block->next = tc__device_pool;
+    tc__device_pool = block;
 }
 
-int tc__cuda_copy_h2d(float *dst_dev, const float *src_host, size_t count) {
-    if (!dst_dev || !src_host || tc__cuda_state <= 0) return 0;
+int tc__device_copy_h2d(float *dst_dev, const float *src_host, size_t count) {
+    if (!dst_dev || !src_host || tc__device_state <= 0) return 0;
     if (count == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     return cudaMemcpy(dst_dev, src_host, count * sizeof(float),
                       cudaMemcpyHostToDevice) == cudaSuccess;
 }
 
-int tc__cuda_copy_d2h(float *dst_host, const float *src_dev, size_t count) {
-    if (!dst_host || !src_dev || tc__cuda_state <= 0) return 0;
+int tc__device_copy_d2h(float *dst_host, const float *src_dev, size_t count) {
+    if (!dst_host || !src_dev || tc__device_state <= 0) return 0;
     if (count == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     return cudaMemcpy(dst_host, src_dev, count * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
@@ -192,7 +194,7 @@ static unsigned int tc__grid_for(size_t n) {
  * D2H). Un fallo de ejecución se detecta en el siguiente punto de
  * sincronía y sigue la política de dispositivo irrecuperable (abort con
  * diagnóstico), igual que antes pero con detección diferida. */
-static int tc__cuda_commit(const char *what) {
+static int tc__device_commit(const char *what) {
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "TensorC CUDA: %s falló: %s\n", what,
@@ -204,7 +206,7 @@ static int tc__cuda_commit(const char *what) {
 
 static cublasHandle_t tc__cublas(void) {
     if (!tc__cublas_handle) {
-        cudaSetDevice(tc__cuda_current_device);
+        cudaSetDevice(tc__device_current_device);
         if (cublasCreate(&tc__cublas_handle) != CUBLAS_STATUS_SUCCESS) {
             tc__cublas_handle = NULL;
             return NULL;
@@ -224,7 +226,7 @@ static int tc__fits_int(size_t m, size_t k, size_t n) {
            m <= int_max && k <= int_max && n <= int_max;
 }
 
-int tc__cuda_matmul_nn(const float *a, const float *b, float *c,
+int tc__device_matmul_nn(const float *a, const float *b, float *c,
                        size_t m, size_t k, size_t n) {
     if (!a || !b || !c || !tc__fits_int(m, k, n)) return 0;
     cublasHandle_t handle = tc__cublas();
@@ -236,10 +238,10 @@ int tc__cuda_matmul_nn(const float *a, const float *b, float *c,
         (int)n, (int)m, (int)k,
         &one, b, (int)n, a, (int)k,
         &zero, c, (int)n);
-    return st == CUBLAS_STATUS_SUCCESS && tc__cuda_commit("matmul_nn");
+    return st == CUBLAS_STATUS_SUCCESS && tc__device_commit("matmul_nn");
 }
 
-int tc__cuda_matmul_nt(const float *g, const float *b, float *da,
+int tc__device_matmul_nt(const float *g, const float *b, float *da,
                        size_t m, size_t k, size_t n) {
     if (!g || !b || !da || !tc__fits_int(m, k, n)) return 0;
     cublasHandle_t handle = tc__cublas();
@@ -252,10 +254,10 @@ int tc__cuda_matmul_nt(const float *g, const float *b, float *da,
         (int)k, (int)m, (int)n,
         &one, b, (int)n, g, (int)n,
         &one, da, (int)k);
-    return st == CUBLAS_STATUS_SUCCESS && tc__cuda_commit("matmul_nt");
+    return st == CUBLAS_STATUS_SUCCESS && tc__device_commit("matmul_nt");
 }
 
-int tc__cuda_matmul_tn(const float *a, const float *g, float *db,
+int tc__device_matmul_tn(const float *a, const float *g, float *db,
                        size_t m, size_t k, size_t n) {
     if (!a || !g || !db || !tc__fits_int(m, k, n)) return 0;
     cublasHandle_t handle = tc__cublas();
@@ -268,7 +270,7 @@ int tc__cuda_matmul_tn(const float *a, const float *g, float *db,
         (int)n, (int)k, (int)m,
         &one, g, (int)n, a, (int)k,
         &one, db, (int)n);
-    return st == CUBLAS_STATUS_SUCCESS && tc__cuda_commit("matmul_tn");
+    return st == CUBLAS_STATUS_SUCCESS && tc__device_commit("matmul_tn");
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,7 +299,7 @@ __device__ static size_t tc__broadcast_index(
 
 __global__ static void tc__add_fwd_kernel(const float *a, const float *b,
                                           float *out, size_t n,
-                                          tc_cuda_broadcast_desc d) {
+                                          tc_device_broadcast_desc d) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = a[tc__broadcast_index(d.a_shape, d.a_strides, d.a_ndim,
@@ -308,7 +310,7 @@ __global__ static void tc__add_fwd_kernel(const float *a, const float *b,
 
 __global__ static void tc__mul_fwd_kernel(const float *a, const float *b,
                                           float *out, size_t n,
-                                          tc_cuda_broadcast_desc d) {
+                                          tc_device_broadcast_desc d) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = a[tc__broadcast_index(d.a_shape, d.a_strides, d.a_ndim,
@@ -323,7 +325,7 @@ __global__ static void tc__mul_fwd_kernel(const float *a, const float *b,
  * suite valida con tolerancias de diferencias finitas). */
 __global__ static void tc__add_bwd_kernel(const float *g, float *ga,
                                           float *gb, size_t n,
-                                          tc_cuda_broadcast_desc d,
+                                          tc_device_broadcast_desc d,
                                           int want_a, int want_b) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -343,7 +345,7 @@ __global__ static void tc__add_bwd_kernel(const float *g, float *ga,
 __global__ static void tc__mul_bwd_kernel(const float *g, const float *a,
                                           const float *b, float *ga,
                                           float *gb, size_t n,
-                                          tc_cuda_broadcast_desc d,
+                                          tc_device_broadcast_desc d,
                                           int want_a, int want_b) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -440,124 +442,124 @@ __global__ static void tc__softmax_bwd_kernel(const float *y, const float *g,
 /* Wrappers de los kernels.                                            */
 /* ------------------------------------------------------------------ */
 
-int tc__cuda_add_forward(const float *a, const float *b, float *out,
-                         size_t n, const tc_cuda_broadcast_desc *desc) {
-    if (!a || !b || !out || !desc || tc__cuda_state <= 0) return 0;
+int tc__device_add_forward(const float *a, const float *b, float *out,
+                         size_t n, const tc_device_broadcast_desc *desc) {
+    if (!a || !b || !out || !desc || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__add_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(a, b, out, n,
                                                              *desc);
-    return tc__cuda_commit("add_forward");
+    return tc__device_commit("add_forward");
 }
 
-int tc__cuda_mul_forward(const float *a, const float *b, float *out,
-                         size_t n, const tc_cuda_broadcast_desc *desc) {
-    if (!a || !b || !out || !desc || tc__cuda_state <= 0) return 0;
+int tc__device_mul_forward(const float *a, const float *b, float *out,
+                         size_t n, const tc_device_broadcast_desc *desc) {
+    if (!a || !b || !out || !desc || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__mul_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(a, b, out, n,
                                                              *desc);
-    return tc__cuda_commit("mul_forward");
+    return tc__device_commit("mul_forward");
 }
 
-int tc__cuda_add_backward(const float *g, float *ga, float *gb, size_t n,
-                          const tc_cuda_broadcast_desc *desc,
+int tc__device_add_backward(const float *g, float *ga, float *gb, size_t n,
+                          const tc_device_broadcast_desc *desc,
                           int want_a, int want_b) {
-    if (!g || !desc || tc__cuda_state <= 0) return 0;
+    if (!g || !desc || tc__device_state <= 0) return 0;
     if (want_a && !ga) return 0;
     if (want_b && !gb) return 0;
     if (!want_a && !want_b) return 1;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__add_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
         g, ga, gb, n, *desc, want_a, want_b);
-    return tc__cuda_commit("add_backward");
+    return tc__device_commit("add_backward");
 }
 
-int tc__cuda_mul_backward(const float *g, const float *a, const float *b,
+int tc__device_mul_backward(const float *g, const float *a, const float *b,
                           float *ga, float *gb, size_t n,
-                          const tc_cuda_broadcast_desc *desc,
+                          const tc_device_broadcast_desc *desc,
                           int want_a, int want_b) {
-    if (!g || !a || !b || !desc || tc__cuda_state <= 0) return 0;
+    if (!g || !a || !b || !desc || tc__device_state <= 0) return 0;
     if (want_a && !ga) return 0;
     if (want_b && !gb) return 0;
     if (!want_a && !want_b) return 1;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__mul_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
         g, a, b, ga, gb, n, *desc, want_a, want_b);
-    return tc__cuda_commit("mul_backward");
+    return tc__device_commit("mul_backward");
 }
 
-int tc__cuda_relu_forward(const float *x, float *out, size_t n) {
-    if (!x || !out || tc__cuda_state <= 0) return 0;
+int tc__device_relu_forward(const float *x, float *out, size_t n) {
+    if (!x || !out || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__relu_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(x, out, n);
-    return tc__cuda_commit("relu_forward");
+    return tc__device_commit("relu_forward");
 }
 
-int tc__cuda_relu_backward(const float *x, const float *g, float *gx,
+int tc__device_relu_backward(const float *x, const float *g, float *gx,
                            size_t n) {
-    if (!x || !g || !gx || tc__cuda_state <= 0) return 0;
+    if (!x || !g || !gx || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__relu_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(x, g, gx, n);
-    return tc__cuda_commit("relu_backward");
+    return tc__device_commit("relu_backward");
 }
 
-int tc__cuda_sigmoid_forward(const float *x, float *out, size_t n) {
-    if (!x || !out || tc__cuda_state <= 0) return 0;
+int tc__device_sigmoid_forward(const float *x, float *out, size_t n) {
+    if (!x || !out || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__sigmoid_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(x, out, n);
-    return tc__cuda_commit("sigmoid_forward");
+    return tc__device_commit("sigmoid_forward");
 }
 
-int tc__cuda_sigmoid_backward(const float *y, const float *g, float *gx,
+int tc__device_sigmoid_backward(const float *y, const float *g, float *gx,
                               size_t n) {
-    if (!y || !g || !gx || tc__cuda_state <= 0) return 0;
+    if (!y || !g || !gx || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__sigmoid_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(y, g, gx, n);
-    return tc__cuda_commit("sigmoid_backward");
+    return tc__device_commit("sigmoid_backward");
 }
 
-int tc__cuda_tanh_forward(const float *x, float *out, size_t n) {
-    if (!x || !out || tc__cuda_state <= 0) return 0;
+int tc__device_tanh_forward(const float *x, float *out, size_t n) {
+    if (!x || !out || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__tanh_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(x, out, n);
-    return tc__cuda_commit("tanh_forward");
+    return tc__device_commit("tanh_forward");
 }
 
-int tc__cuda_tanh_backward(const float *y, const float *g, float *gx,
+int tc__device_tanh_backward(const float *y, const float *g, float *gx,
                            size_t n) {
-    if (!y || !g || !gx || tc__cuda_state <= 0) return 0;
+    if (!y || !g || !gx || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__tanh_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(y, g, gx, n);
-    return tc__cuda_commit("tanh_backward");
+    return tc__device_commit("tanh_backward");
 }
 
-int tc__cuda_softmax_forward(const float *x, float *out, size_t rows,
+int tc__device_softmax_forward(const float *x, float *out, size_t rows,
                              size_t classes) {
-    if (!x || !out || classes == 0 || tc__cuda_state <= 0) return 0;
+    if (!x || !out || classes == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__softmax_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, out, rows, classes);
-    return tc__cuda_commit("softmax_forward");
+    return tc__device_commit("softmax_forward");
 }
 
-int tc__cuda_softmax_backward(const float *y, const float *g, float *gx,
+int tc__device_softmax_backward(const float *y, const float *g, float *gx,
                               size_t rows, size_t classes) {
-    if (!y || !g || !gx || classes == 0 || tc__cuda_state <= 0) return 0;
+    if (!y || !g || !gx || classes == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__softmax_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         y, g, gx, rows, classes);
-    return tc__cuda_commit("softmax_backward");
+    return tc__device_commit("softmax_backward");
 }
 
 /* ------------------------------------------------------------------ */
@@ -728,19 +730,19 @@ __global__ static void tc__attn_ds_kernel(const float *p, float *dp,
 /* Atención: forward y backward vía GEMM batida + kernels.             */
 /* ------------------------------------------------------------------ */
 
-int tc__cuda_attention_forward(const float *q, const float *k,
+int tc__device_attention_forward(const float *q, const float *k,
                                const float *v, float *out, size_t batch,
                                size_t q_seq, size_t k_seq, size_t depth,
                                size_t v_depth, int causal) {
-    if (!q || !k || !v || !out || tc__cuda_state <= 0) return 0;
+    if (!q || !k || !v || !out || tc__device_state <= 0) return 0;
     if (!tc__attention_fits_int(batch, q_seq, k_seq, depth, v_depth))
         return 0;
     const size_t score_count = q_seq * k_seq;
     if (batch > ((size_t)-1) / score_count) return 0;
-    float *scores = tc__cuda_alloc(batch * score_count);
+    float *scores = tc__device_alloc(batch * score_count);
     if (!scores) return 0;
     const float scale = 1.0f / sqrtf((float)depth);
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     /* S = scale · Q·Kᵀ por lote: Sᵀ[k_seq,q_seq] = K·Qᵀ se escribe con
      * K transpuesta (OP_T) y Q sin transponer; alpha lleva la escala. */
     int ok = tc__gemm_strided_batched(
@@ -760,8 +762,8 @@ int tc__cuda_attention_forward(const float *q, const float *k,
             0.0f, out, (int)v_depth, (long long)(q_seq * v_depth),
             (int)batch);
     }
-    tc__cuda_free(scores, batch * score_count);
-    return ok && tc__cuda_commit("attention_forward");
+    tc__device_free(scores, batch * score_count);
+    return ok && tc__device_commit("attention_forward");
 }
 
 /* Fallo a mitad de la acumulación de gradientes = estado irrecuperable
@@ -774,27 +776,27 @@ static void tc__attention_fatal(const char *what) {
     abort();
 }
 
-int tc__cuda_attention_backward(const float *q, const float *k,
+int tc__device_attention_backward(const float *q, const float *k,
                                 const float *v, const float *dout,
                                 float *dq, float *dk, float *dv,
                                 size_t batch, size_t q_seq, size_t k_seq,
                                 size_t depth, size_t v_depth, int causal) {
-    if (!q || !k || !v || !dout || tc__cuda_state <= 0) return 0;
+    if (!q || !k || !v || !dout || tc__device_state <= 0) return 0;
     if (!dq && !dk && !dv) return 1;
     if (!tc__attention_fits_int(batch, q_seq, k_seq, depth, v_depth))
         return 0;
     const size_t score_count = q_seq * k_seq;
     if (batch > ((size_t)-1) / score_count) return 0;
-    float *p = tc__cuda_alloc(batch * score_count);
-    float *dp = tc__cuda_alloc(batch * score_count);
+    float *p = tc__device_alloc(batch * score_count);
+    float *dp = tc__device_alloc(batch * score_count);
     if (!p || !dp) {
-        tc__cuda_free(p, batch * score_count);
-        tc__cuda_free(dp, batch * score_count);
+        tc__device_free(p, batch * score_count);
+        tc__device_free(dp, batch * score_count);
         return 0;
     }
     const float scale = 1.0f / sqrtf((float)depth);
     const size_t rows = batch * q_seq;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     /* Rehacer P (idéntico al forward, sin escribir la salida). */
     int ok = tc__gemm_strided_batched(
         CUBLAS_OP_T, CUBLAS_OP_N, (int)k_seq, (int)q_seq, (int)depth, scale,
@@ -814,10 +816,10 @@ int tc__cuda_attention_backward(const float *q, const float *k,
     if (ok)
         tc__attn_ds_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
             p, dp, rows, k_seq, scale);
-    if (!ok || !tc__cuda_commit("attention_backward prep")) {
+    if (!ok || !tc__device_commit("attention_backward prep")) {
         /* Nada se acumuló todavía: el llamador puede caer a CPU. */
-        tc__cuda_free(p, batch * score_count);
-        tc__cuda_free(dp, batch * score_count);
+        tc__device_free(p, batch * score_count);
+        tc__device_free(dp, batch * score_count);
         return 0;
     }
     /* Acumulaciones: dV += Pᵀ·dO, dQ += dS·K, dK += dSᵀ·Q (beta=1). Un
@@ -846,9 +848,9 @@ int tc__cuda_attention_backward(const float *q, const float *k,
                   1.0f, dk, (int)depth, (long long)(k_seq * depth),
                   (int)batch))
         tc__attention_fatal("dK");
-    tc__cuda_free(p, batch * score_count);
-    tc__cuda_free(dp, batch * score_count);
-    return tc__cuda_commit("attention_backward");
+    tc__device_free(p, batch * score_count);
+    tc__device_free(dp, batch * score_count);
+    return tc__device_commit("attention_backward");
 }
 
 /* ------------------------------------------------------------------ */
@@ -857,10 +859,10 @@ int tc__cuda_attention_backward(const float *q, const float *k,
 
 __global__ static void tc__permute_fwd_kernel(const float *in, float *out,
                                               size_t n,
-                                              tc_cuda_permute_desc d) {
+                                              tc_device_permute_desc d) {
     const size_t lin = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (lin >= n) return;
-    size_t in_idx[TC_CUDA_MAX_DIMS];
+    size_t in_idx[TC_DEVICE_MAX_DIMS];
     for (int dim = 0; dim < d.ndim; ++dim)
         in_idx[dim] = (lin / d.in_strides[dim]) % d.in_shape[dim];
     size_t out_lin = 0;
@@ -871,10 +873,10 @@ __global__ static void tc__permute_fwd_kernel(const float *in, float *out,
 
 __global__ static void tc__permute_bwd_kernel(const float *g, float *gx,
                                               size_t n,
-                                              tc_cuda_permute_desc d) {
+                                              tc_device_permute_desc d) {
     const size_t lin = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (lin >= n) return;
-    size_t in_idx[TC_CUDA_MAX_DIMS];
+    size_t in_idx[TC_DEVICE_MAX_DIMS];
     for (int dim = 0; dim < d.ndim; ++dim)
         in_idx[dim] = (lin / d.in_strides[dim]) % d.in_shape[dim];
     size_t out_lin = 0;
@@ -890,88 +892,88 @@ __global__ static void tc__accumulate_kernel(float *dst, const float *src,
     dst[i] += src[i];
 }
 
-int tc__cuda_permute_forward(const float *in, float *out, size_t n,
-                             const tc_cuda_permute_desc *desc) {
-    if (!in || !out || !desc || tc__cuda_state <= 0) return 0;
+int tc__device_permute_forward(const float *in, float *out, size_t n,
+                             const tc_device_permute_desc *desc) {
+    if (!in || !out || !desc || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__permute_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(in, out, n,
                                                                  *desc);
-    return tc__cuda_commit("permute_forward");
+    return tc__device_commit("permute_forward");
 }
 
-int tc__cuda_permute_backward(const float *g, float *gx, size_t n,
-                              const tc_cuda_permute_desc *desc) {
-    if (!g || !gx || !desc || tc__cuda_state <= 0) return 0;
+int tc__device_permute_backward(const float *g, float *gx, size_t n,
+                              const tc_device_permute_desc *desc) {
+    if (!g || !gx || !desc || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__permute_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(g, gx, n,
                                                                  *desc);
-    return tc__cuda_commit("permute_backward");
+    return tc__device_commit("permute_backward");
 }
 
-int tc__cuda_copy_d2d(float *dst_dev, const float *src_dev, size_t count) {
-    if (!dst_dev || !src_dev || tc__cuda_state <= 0) return 0;
+int tc__device_copy_d2d(float *dst_dev, const float *src_dev, size_t count) {
+    if (!dst_dev || !src_dev || tc__device_state <= 0) return 0;
     if (count == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     return cudaMemcpy(dst_dev, src_dev, count * sizeof(float),
                       cudaMemcpyDeviceToDevice) == cudaSuccess;
 }
 
-int tc__cuda_accumulate(float *dst, const float *src, size_t n) {
-    if (!dst || !src || tc__cuda_state <= 0) return 0;
+int tc__device_accumulate(float *dst, const float *src, size_t n) {
+    if (!dst || !src || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__accumulate_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(dst, src, n);
-    return tc__cuda_commit("accumulate");
+    return tc__device_commit("accumulate");
 }
 
 /* ------------------------------------------------------------------ */
 /* Wrappers de layer normalization.                                    */
 /* ------------------------------------------------------------------ */
 
-int tc__cuda_layer_norm_forward(const float *x, float *out, size_t rows,
+int tc__device_layer_norm_forward(const float *x, float *out, size_t rows,
                                 size_t width) {
-    if (!x || !out || width == 0 || tc__cuda_state <= 0) return 0;
+    if (!x || !out || width == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__layer_norm_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, out, rows, width);
-    return tc__cuda_commit("layer_norm_forward");
+    return tc__device_commit("layer_norm_forward");
 }
 
-int tc__cuda_layer_norm_backward(const float *x, const float *g, float *gx,
+int tc__device_layer_norm_backward(const float *x, const float *g, float *gx,
                                  size_t rows, size_t width) {
-    if (!x || !g || !gx || width == 0 || tc__cuda_state <= 0) return 0;
+    if (!x || !g || !gx || width == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__layer_norm_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, g, gx, rows, width);
-    return tc__cuda_commit("layer_norm_backward");
+    return tc__device_commit("layer_norm_backward");
 }
 
 /* ------------------------------------------------------------------ */
 /* Wrappers de RMSNorm.                                                */
 /* ------------------------------------------------------------------ */
 
-int tc__cuda_rms_norm_forward(const float *x, float *out, size_t rows,
+int tc__device_rms_norm_forward(const float *x, float *out, size_t rows,
                               size_t width) {
-    if (!x || !out || width == 0 || tc__cuda_state <= 0) return 0;
+    if (!x || !out || width == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__rms_norm_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, out, rows, width);
-    return tc__cuda_commit("rms_norm_forward");
+    return tc__device_commit("rms_norm_forward");
 }
 
-int tc__cuda_rms_norm_backward(const float *x, const float *g, float *gx,
+int tc__device_rms_norm_backward(const float *x, const float *g, float *gx,
                                size_t rows, size_t width) {
-    if (!x || !g || !gx || width == 0 || tc__cuda_state <= 0) return 0;
+    if (!x || !g || !gx || width == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__rms_norm_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         x, g, gx, rows, width);
-    return tc__cuda_commit("rms_norm_backward");
+    return tc__device_commit("rms_norm_backward");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1041,30 +1043,30 @@ __global__ static void tc__adam_step_kernel(float *param, const float *grad,
     param[i] -= lr * m_hat / (sqrtf(v_hat) + epsilon);
 }
 
-int tc__cuda_cross_entropy_forward(const float *p, const float *t,
+int tc__device_cross_entropy_forward(const float *p, const float *t,
                                    float *out, size_t n, size_t rows) {
-    if (!p || !t || !out || rows == 0 || tc__cuda_state <= 0) return 0;
+    if (!p || !t || !out || rows == 0 || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     if (cudaMemset(out, 0, sizeof(float)) != cudaSuccess) return 0;
     tc__ce_fwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(p, t, out, n,
                                                             rows);
-    return tc__cuda_commit("cross_entropy_forward");
+    return tc__device_commit("cross_entropy_forward");
 }
 
-int tc__cuda_cross_entropy_backward(const float *p, const float *t,
+int tc__device_cross_entropy_backward(const float *p, const float *t,
                                     const float *g, float *gp, float *gt,
                                     size_t n, size_t rows, int want_p,
                                     int want_t) {
-    if (!p || !t || !g || rows == 0 || tc__cuda_state <= 0) return 0;
+    if (!p || !t || !g || rows == 0 || tc__device_state <= 0) return 0;
     if (want_p && !gp) return 0;
     if (want_t && !gt) return 0;
     if (!want_p && !want_t) return 1;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__ce_bwd_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
         p, t, g, gp, gt, n, rows, want_p, want_t);
-    return tc__cuda_commit("cross_entropy_backward");
+    return tc__device_commit("cross_entropy_backward");
 }
 
 /* Un hilo por elemento de salida: copia la fila ids[i] de la tabla. */
@@ -1126,72 +1128,72 @@ __global__ static void tc__sparse_ce_bwd_kernel(const float *p,
     gp[r * classes + y] += -g[0] / (float)rows / pi;
 }
 
-int tc__cuda_embedding_forward(const float *table, const float *ids,
+int tc__device_embedding_forward(const float *table, const float *ids,
                                float *out, size_t n, size_t dim) {
-    if (!table || !ids || !out || dim == 0 || tc__cuda_state <= 0) return 0;
+    if (!table || !ids || !out || dim == 0 || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__embedding_fwd_kernel<<<tc__grid_for(n * dim), TC_CUDA_THREADS>>>(
         table, ids, out, n, dim);
-    return tc__cuda_commit("embedding_forward");
+    return tc__device_commit("embedding_forward");
 }
 
-int tc__cuda_embedding_backward(const float *g, const float *ids,
+int tc__device_embedding_backward(const float *g, const float *ids,
                                 float *gtable, size_t n, size_t dim) {
-    if (!g || !ids || !gtable || dim == 0 || tc__cuda_state <= 0) return 0;
+    if (!g || !ids || !gtable || dim == 0 || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__embedding_bwd_kernel<<<tc__grid_for(n * dim), TC_CUDA_THREADS>>>(
         g, ids, gtable, n, dim);
-    return tc__cuda_commit("embedding_backward");
+    return tc__device_commit("embedding_backward");
 }
 
-int tc__cuda_sparse_ce_forward(const float *p, const float *ids, float *out,
+int tc__device_sparse_ce_forward(const float *p, const float *ids, float *out,
                                size_t rows, size_t classes) {
-    if (!p || !ids || !out || classes == 0 || tc__cuda_state <= 0) return 0;
+    if (!p || !ids || !out || classes == 0 || tc__device_state <= 0) return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     if (cudaMemset(out, 0, sizeof(float)) != cudaSuccess) return 0;
     tc__sparse_ce_fwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         p, ids, out, rows, classes);
-    return tc__cuda_commit("sparse_ce_forward");
+    return tc__device_commit("sparse_ce_forward");
 }
 
-int tc__cuda_sparse_ce_backward(const float *p, const float *ids,
+int tc__device_sparse_ce_backward(const float *p, const float *ids,
                                 const float *g, float *gp, size_t rows,
                                 size_t classes) {
-    if (!p || !ids || !g || !gp || classes == 0 || tc__cuda_state <= 0)
+    if (!p || !ids || !g || !gp || classes == 0 || tc__device_state <= 0)
         return 0;
     if (rows == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__sparse_ce_bwd_kernel<<<tc__grid_for(rows), TC_CUDA_THREADS>>>(
         p, ids, g, gp, rows, classes);
-    return tc__cuda_commit("sparse_ce_backward");
+    return tc__device_commit("sparse_ce_backward");
 }
 
-int tc__cuda_sgd_step(float *param, const float *grad, size_t n, float lr) {
-    if (!param || !grad || tc__cuda_state <= 0) return 0;
+int tc__device_sgd_step(float *param, const float *grad, size_t n, float lr) {
+    if (!param || !grad || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__sgd_step_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(param, grad, n,
                                                               lr);
-    return tc__cuda_commit("sgd_step");
+    return tc__device_commit("sgd_step");
 }
 
-int tc__cuda_adam_step(float *param, const float *grad, float *m, float *v,
+int tc__device_adam_step(float *param, const float *grad, float *m, float *v,
                        size_t n, float lr, float beta1, float beta2,
                        float bias1, float bias2, float epsilon) {
-    if (!param || !grad || !m || !v || tc__cuda_state <= 0) return 0;
+    if (!param || !grad || !m || !v || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     tc__adam_step_kernel<<<tc__grid_for(n), TC_CUDA_THREADS>>>(
         param, grad, m, v, n, lr, beta1, beta2, bias1, bias2, epsilon);
-    return tc__cuda_commit("adam_step");
+    return tc__device_commit("adam_step");
 }
 
-int tc__cuda_zero_fill(float *dst, size_t n) {
-    if (!dst || tc__cuda_state <= 0) return 0;
+int tc__device_zero_fill(float *dst, size_t n) {
+    if (!dst || tc__device_state <= 0) return 0;
     if (n == 0) return 1;
-    cudaSetDevice(tc__cuda_current_device);
+    cudaSetDevice(tc__device_current_device);
     return cudaMemset(dst, 0, n * sizeof(float)) == cudaSuccess;
 }

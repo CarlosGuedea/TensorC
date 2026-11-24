@@ -19,6 +19,7 @@ from ._tensorc import (
     cuda_available,
     cuda_device,
     cuda_set_device,
+    metal_available,
     load,
     preprocess_mnist_images,
     save,
@@ -28,7 +29,7 @@ from .model import Model
 from .rl import DQNAgent
 from .sklearn import TensorCClassifier
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
     "Tensor",
@@ -51,5 +52,6 @@ __all__ = [
     "cuda_available",
     "cuda_device",
     "cuda_set_device",
+    "metal_available",
     "__version__",
 ]

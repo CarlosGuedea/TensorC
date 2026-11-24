@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.0 — backend Metal opcional
+
+- Nuevo backend opcional Apple Metal para operaciones de tensores en macOS; las operaciones no soportadas siguen en CPU y `tensorc.metal_available()` indica si se activó.
+- CMake y la extensión CPython pueden compilar Metal; las ruedas macOS de PyPI se construyen con este backend, mientras Linux y Windows conservan sus rutas CPU/CUDA.
+- La medición inicial de MNIST no mostró una aceleración de entrenamiento significativa frente a CPU; no se prometen mejoras de rendimiento hasta optimizar esa ruta.
+- Flujo de publicación PyPI preparado para Trusted Publishing y sin token API persistente en GitHub Actions.
+
 ## 0.14.0 — Model de alto nivel, serialización, avgpool y optimizaciones
 
 - Nueva `tensorc.Model`: envuelve un forward + lista de parámetros con `fit` (mini-batches con shuffle), `evaluate`, `predict`, `save_weights` y `load_weights`. Python puro sobre el núcleo C.

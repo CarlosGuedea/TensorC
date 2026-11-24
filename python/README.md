@@ -227,6 +227,28 @@ cd TensorC
 python3 -m pip install ./python
 ```
 
+### Metal opcional en Apple Silicon
+
+Para compilar el paquete local con el backend Metal (requiere macOS y Xcode):
+
+```sh
+cd python
+TENSORC_METAL=1 python3 setup.py build_ext --inplace
+```
+
+`tensorc.metal_available()` indica si Metal está activo. Las ruedas macOS de
+PyPI se compilan con Metal; en hardware compatible, Conv2D, max-pooling,
+ReLU, softmax, cross-entropy, operaciones elemento a elemento, matmul y Adam
+usan la GPU cuando el tamaño lo justifica; las operaciones restantes caen a
+CPU. Un tensor pequeño puede ser más rápido en CPU por el costo de enviar
+trabajo a la GPU. Para compilar la extensión localmente también puedes activar
+`TENSORC_METAL=1`. Para CMake se usa `-DTENSORC_USE_METAL=ON`.
+
+Medición inicial en Mac M1 (CNN MNIST, 8,192 imágenes, 4 épocas, lote 64):
+Metal 46.66 s; CPU 47.40 s; NumPy 16.15 s. En esta red no se observó una
+aceleración de entrenamiento significativa; el backend requiere optimización
+antes de esperar que la GPU supere la ruta CPU/Accelerate.
+
 ## Proceso de release (maintainers)
 
 El repositorio incluye un flujo de GitHub Actions
@@ -239,7 +261,7 @@ rueda y publica todo en PyPI automáticamente. Para publicar una versión:
 #    python/pyproject.toml y python/tensorc/__init__.py
 # 2. Ejecuta bash python/sync_core.sh tras cambiar el núcleo C
 # 3. Etiqueta y sube:
-git tag v0.15.0 && git push origin v0.15.0
+git tag v0.16.0 && git push origin v0.16.0
 ```
 
 Para subir a mano (necesitas un token de PyPI):

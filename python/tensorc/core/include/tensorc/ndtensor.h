@@ -280,6 +280,9 @@ int tc_cuda_available(void);
 int tc_cuda_set_device(int device); /* 1 si el dispositivo quedó activo */
 int tc_cuda_device(void);           /* índice activo o -1 sin backend */
 
+/* Backend Metal opcional para las GPU Apple. */
+int tc_metal_available(void);
+
 #ifdef __cplusplus
 }
 #endif

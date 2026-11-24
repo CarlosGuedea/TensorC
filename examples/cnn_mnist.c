@@ -11,13 +11,13 @@
  * El entrenamiento usa el autograd de tc_tensor_nd y pasos SGD.
  */
 #include <tensorc/tensorc.h>
+#include "../tensorc_time.h"
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* --- RNG xorshift32 determinista --- */
 static unsigned int rng_state = 1u;
@@ -242,9 +242,7 @@ static void cnn_train_step(cnn *net) {
 }
 
 static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    return tc_monotonic_ms();
 }
 
 static float *build_targets(const dataset *ds, size_t begin, size_t batch) {

@@ -13,11 +13,11 @@
  *   BACKWARD_MS_MEDIAN <ms>
  */
 #include <tensorc/tensorc.h>
+#include "../../tensorc_time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static float *read_floats(const char *path, size_t count) {
     FILE *file = fopen(path, "rb");
@@ -38,9 +38,7 @@ static int compare_doubles(const void *a, const void *b) {
 }
 
 static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    return tc_monotonic_ms();
 }
 
 /* Devuelve la mediana y el mínimo en milisegundos. */

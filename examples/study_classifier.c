@@ -15,13 +15,13 @@
  * imagenes float32 y metadatos float32.
  */
 #include <tensorc/tensorc.h>
+#include "../tensorc_time.h"
 
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 enum { CLASS_NO_APTO = 0, CLASS_APTO = 1, UNKNOWN_LABEL = 255 };
 static const uint32_t DATA_MAGIC = 0x54435344u; /* TCSD */
@@ -56,9 +56,7 @@ static unsigned int rng_next(void) {
 }
 
 static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    return tc_monotonic_ms();
 }
 
 static void dataset_free(dataset *ds) {

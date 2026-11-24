@@ -237,7 +237,8 @@ TENSORC_METAL=1 python3 setup.py build_ext --inplace
 ```
 
 `tensorc.metal_available()` indica si Metal está activo. Las ruedas macOS de
-PyPI se compilan con Metal; en hardware compatible, Conv2D, max-pooling,
+PyPI para Apple Silicon se compilan con Metal; Intel macOS conserva CPU. En
+hardware compatible, Conv2D, max-pooling,
 ReLU, softmax, cross-entropy, operaciones elemento a elemento, matmul y Adam
 usan la GPU cuando el tamaño lo justifica; las operaciones restantes caen a
 CPU. Un tensor pequeño puede ser más rápido en CPU por el costo de enviar

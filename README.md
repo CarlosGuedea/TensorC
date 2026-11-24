@@ -5,7 +5,7 @@
 
 TensorC es un framework de redes neuronales pequeño escrito en C11. Ofrece una API de tensores N-dimensionales con autodiferenciación en C. La versión actual es 0.16.0 y se puede instalar desde Python con `pip install tensorc`.
 
-La versión 0.16.0 incluye operaciones N-dimensionales, autograd, capas densas y convolucionales, Adam y checkpoints. En macOS usa Accelerate en CPU y ofrece un backend Metal opcional para ciertas operaciones; lo no soportado continúa en CPU. Las ruedas macOS de PyPI se construyen con Metal. El backend CUDA sigue disponible como opción en sistemas compatibles. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. TensorC no requiere TensorFlow.
+La versión 0.16.0 incluye operaciones N-dimensionales, autograd, capas densas y convolucionales, Adam y checkpoints. En macOS usa Accelerate en CPU y ofrece un backend Metal opcional para ciertas operaciones; lo no soportado continúa en CPU. Las ruedas de PyPI para Apple Silicon se construyen con Metal; Intel macOS usa CPU. El backend CUDA sigue disponible como opción en sistemas compatibles. El ejemplo `tensorc_cnn_mnist` entrena una CNN completa en C puro. TensorC no requiere TensorFlow.
 
 El código fuente también incorpora una API C experimental para DQN con acciones discretas, replay buffer y red objetivo. `tc_env` ofrece un contrato de entornos C estilo Gymnasium (`reset`/`step`, `terminated`/`truncated`); `tensorc_dqn_cartpole` muestra entrenamiento sin Python. Consulta [el manual de aprendizaje por refuerzo](GUIA_USO.md#15-aprendizaje-por-refuerzo) para compilarlo y usar el agente Python/NumPy.
 

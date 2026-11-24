@@ -42,7 +42,11 @@ elif sys.platform.startswith("linux"):
 # "m" (no existe m.lib y LNK1181 lo rechaza).
 
 use_cuda = os.environ.get("TENSORC_CUDA") == "1"
-use_metal = os.environ.get("TENSORC_METAL") == "1"
+metal_requested = os.environ.get("TENSORC_METAL") == "1"
+if metal_requested and sys.platform != "darwin":
+    raise RuntimeError("TENSORC_METAL is supported only on macOS")
+# Metal is available on Apple Silicon; Intel macOS wheels keep the CPU path.
+use_metal = metal_requested and sysconfig.get_platform().endswith("arm64")
 if use_cuda and use_metal:
     raise RuntimeError("TENSORC_CUDA and TENSORC_METAL cannot be enabled together")
 cuda_home = None
@@ -65,8 +69,6 @@ if use_cuda:
             library_dirs.append(candidate)
 
 if use_metal:
-    if sys.platform != "darwin":
-        raise RuntimeError("TENSORC_METAL is supported only on macOS")
     define_macros.append(("TENSORC_HAS_METAL", "1"))
     extra_link_args.extend([
         "-framework", "Metal",

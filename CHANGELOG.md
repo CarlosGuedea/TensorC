@@ -3,7 +3,7 @@
 ## 0.16.0 — backend Metal opcional
 
 - Nuevo backend opcional Apple Metal para operaciones de tensores en macOS; las operaciones no soportadas siguen en CPU y `tensorc.metal_available()` indica si se activó.
-- CMake y la extensión CPython pueden compilar Metal; las ruedas macOS de PyPI se construyen con este backend, mientras Linux y Windows conservan sus rutas CPU/CUDA.
+- CMake y la extensión CPython pueden compilar Metal; las ruedas Apple Silicon de PyPI se construyen con este backend, mientras Intel macOS, Linux y Windows conservan sus rutas CPU/CUDA.
 - La medición inicial de MNIST no mostró una aceleración de entrenamiento significativa frente a CPU; no se prometen mejoras de rendimiento hasta optimizar esa ruta.
 - Flujo de publicación PyPI preparado para Trusted Publishing y sin token API persistente en GitHub Actions.
 

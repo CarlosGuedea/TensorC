@@ -8,7 +8,7 @@ static int close_enough(float actual, float expected) {
 }
 
 int main(void) {
-    const char *path = "/tmp/tensorc_model_roundtrip.tcm";
+    const char *path = "tensorc_model_roundtrip.tcm";
     const size_t sizes[] = {3, 2};
     const tc_activation activations[] = {TC_RELU, TC_SIGMOID};
     tc_model original = tc_model_create(2, sizes, activations, 2);
@@ -28,7 +28,8 @@ int main(void) {
     int ok = input.data && expected.data && tc_model_save(&original, path);
 
     tc_model loaded = tc_model_load(path);
-    tc_tensor actual = tc_model_predict(&loaded, &input);
+    tc_tensor actual = {0};
+    if (loaded.layers) actual = tc_model_predict(&loaded, &input);
     ok = ok && loaded.layers && loaded.input_size == original.input_size &&
          loaded.layer_count == original.layer_count && actual.data &&
          actual.rows == expected.rows && actual.cols == expected.cols;

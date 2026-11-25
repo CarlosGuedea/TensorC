@@ -10,7 +10,7 @@ static int close_enough(float actual, float expected) {
 
 /* Roundtrip de un tensor único: forma, datos y requires_grad. */
 static int test_single_roundtrip(void) {
-    const char *path = "/tmp/tensorc_nd_single.tcb";
+    const char *path = "tensorc_nd_single.tcb";
     const size_t shape[] = {2, 3, 4};
     const size_t numel = 2 * 3 * 4;
     float values[2 * 3 * 4];
@@ -25,7 +25,8 @@ static int test_single_roundtrip(void) {
          tc_tensor_nd_shape(loaded)[1] == 3 &&
          tc_tensor_nd_shape(loaded)[2] == 4 &&
          tc_tensor_nd_requires_grad(loaded);
-    const float *data = tc_tensor_nd_const_data(loaded);
+    const float *data = loaded ? tc_tensor_nd_const_data(loaded) : NULL;
+    ok = ok && data;
     for (size_t i = 0; ok && i < numel; ++i)
         ok = close_enough(data[i], values[i]);
 
@@ -37,7 +38,7 @@ static int test_single_roundtrip(void) {
 
 /* Roundtrip de un checkpoint de varios tensores. */
 static int test_checkpoint_roundtrip(void) {
-    const char *path = "/tmp/tensorc_nd_checkpoint.tck";
+    const char *path = "tensorc_nd_checkpoint.tck";
     const size_t shape_a[] = {4, 4};
     const size_t shape_b[] = {1, 3, 2};
     const float values_a[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -49,14 +50,16 @@ static int test_checkpoint_roundtrip(void) {
 
     size_t count = 0;
     tc_tensor_nd **loaded = tc_load_checkpoint(path, &count, 0);
-    ok = ok && loaded && count == 2;
+    const int have_pair = loaded && count == 2 && loaded[0] && loaded[1];
+    ok = ok && have_pair;
     ok = ok && tc_tensor_nd_shape(loaded[0])[0] == 4 &&
          tc_tensor_nd_shape(loaded[0])[1] == 4 &&
          tc_tensor_nd_shape(loaded[1])[0] == 1 &&
          tc_tensor_nd_shape(loaded[1])[1] == 3 &&
          tc_tensor_nd_shape(loaded[1])[2] == 2;
-    const float *data_a = tc_tensor_nd_const_data(loaded[0]);
-    const float *data_b = tc_tensor_nd_const_data(loaded[1]);
+    const float *data_a = have_pair ? tc_tensor_nd_const_data(loaded[0]) : NULL;
+    const float *data_b = have_pair ? tc_tensor_nd_const_data(loaded[1]) : NULL;
+    ok = ok && data_a && data_b;
     for (size_t i = 0; ok && i < 16; ++i)
         ok = close_enough(data_a[i], values_a[i]);
     for (size_t i = 0; ok && i < 6; ++i)
@@ -71,8 +74,8 @@ static int test_checkpoint_roundtrip(void) {
 
 /* Rechazos: archivo inexistente, mágico incorrecto y archivo truncado. */
 static int test_rejections(void) {
-    const char *path = "/tmp/tensorc_nd_corrupt.tcb";
-    int ok = tc_tensor_nd_load("/tmp/tensorc_no_existe.tcb", 0) == NULL;
+    const char *path = "tensorc_nd_corrupt.tcb";
+    int ok = tc_tensor_nd_load("tensorc_no_existe.tcb", 0) == NULL;
 
     const size_t shape[] = {2, 2};
     const float values[] = {1, 2, 3, 4};

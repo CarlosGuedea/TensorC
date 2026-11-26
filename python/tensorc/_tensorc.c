@@ -1030,12 +1030,28 @@ static PyTypeObject FlattenLayerType = {
     .tp_doc = "Native flatten operation for Sequential.",
 };
 
+typedef struct {
+    PyObject_HEAD
+    tc_lstm_layer *layer;
+} LSTMLayerObject;
+
+static PyTypeObject LSTMLayerType;
+
+typedef struct {
+    PyObject_HEAD
+    tc_transformer_block *block;
+} TransformerBlockObject;
+
+static PyTypeObject TransformerBlockType;
+
 typedef enum {
     SEQ_CONV2D,
     SEQ_DENSE,
     SEQ_RELU,
     SEQ_MAXPOOL2D,
-    SEQ_FLATTEN
+    SEQ_FLATTEN,
+    SEQ_LSTM,
+    SEQ_TRANSFORMER
 } SequentialKind;
 
 typedef struct {
@@ -1123,10 +1139,27 @@ static PyObject *sequential_new(PyTypeObject *type, PyObject *args,
             item->width = pool->width;
         } else if (PyObject_TypeCheck(layer, &FlattenLayerType)) {
             item->kind = SEQ_FLATTEN;
+        } else if (PyObject_TypeCheck(layer, &LSTMLayerType)) {
+            LSTMLayerObject *lstm = (LSTMLayerObject *)layer;
+            item->kind = SEQ_LSTM;
+            if (sequential_add_param(self, tc_lstm_layer_weight_ih(lstm->layer)) < 0 ||
+                sequential_add_param(self, tc_lstm_layer_weight_hh(lstm->layer)) < 0 ||
+                sequential_add_param(self, tc_lstm_layer_bias(lstm->layer)) < 0)
+                goto fail;
+        } else if (PyObject_TypeCheck(layer, &TransformerBlockType)) {
+            TransformerBlockObject *transformer = (TransformerBlockObject *)layer;
+            item->kind = SEQ_TRANSFORMER;
+            const size_t param_count =
+                tc_transformer_block_param_count(transformer->block);
+            for (size_t p = 0; p < param_count; ++p)
+                if (sequential_add_param(self,
+                        tc_transformer_block_param(transformer->block, p)) < 0)
+                    goto fail;
         } else {
             PyErr_SetString(PyExc_TypeError,
                             "Sequential supports Conv2DLayer, DenseLayer, "
-                            "ReLULayer, MaxPool2DLayer, and FlattenLayer");
+                            "ReLULayer, MaxPool2DLayer, FlattenLayer, "
+                            "LSTMLayer, and TransformerBlock");
             goto fail;
         }
         Py_INCREF(layer);
@@ -1174,6 +1207,25 @@ static tc_tensor_nd *sequential_forward_tensor(SequentialObject *self,
             next = tc_tensor_nd_reshape_to(current, shape, 2);
             break;
         }
+        case SEQ_LSTM: {
+            const size_t time_major_axes[] = {1, 0, 2};
+            tc_tensor_nd *time_major =
+                tc_tensor_nd_permute(current, time_major_axes, 3);
+            tc_tensor_nd *output = time_major
+                ? tc_lstm_layer_forward(
+                      ((LSTMLayerObject *)item->owner)->layer, time_major)
+                : NULL;
+            tc_tensor_nd_free(time_major);
+            next = output
+                ? tc_tensor_nd_permute(output, time_major_axes, 3)
+                : NULL;
+            tc_tensor_nd_free(output);
+            break;
+        }
+        case SEQ_TRANSFORMER:
+            next = tc_transformer_block_forward(
+                ((TransformerBlockObject *)item->owner)->block, current);
+            break;
         }
         tc_tensor_nd_free(owned);
         if (!next) return NULL;
@@ -1466,12 +1518,6 @@ static PyTypeObject SequentialType = {
 };
 
 /* --- Capa LSTM --- */
-typedef struct {
-    PyObject_HEAD
-    tc_lstm_layer *layer;
-} LSTMLayerObject;
-
-static PyTypeObject LSTMLayerType;
 
 static void lstm_layer_dealloc(LSTMLayerObject *self) {
     tc_lstm_layer_free(self->layer);
@@ -1553,13 +1599,6 @@ static PyTypeObject LSTMLayerType = {
 };
 
 /* --- Capa Transformer (bloque pre-norm) --- */
-typedef struct {
-    PyObject_HEAD
-    tc_transformer_block *block;
-} TransformerBlockObject;
-
-static PyTypeObject TransformerBlockType;
-
 static void transformer_block_dealloc(TransformerBlockObject *self) {
     tc_transformer_block_free(self->block);
     PyObject_Del(self);

@@ -115,6 +115,30 @@ y = bloque.forward(x)                    # [batch, seq, 64]
 opt = tensorc.Adam(bloque.params, 0.001) # los 8 parámetros del bloque
 ```
 
+### Clasificación de secuencias con entrenamiento nativo en C
+
+`Sequential` acepta LSTM y TransformerBlock. La entrada de entrenamiento es
+batch-first `[muestras, secuencia, características]`; la capa LSTM se adapta
+internamente a su API directa time-major. Aplana las salidas por muestra antes
+de la capa Dense final:
+
+```python
+seq_len, clases = 20, 10
+modelo = tensorc.Sequential([
+    tensorc.LSTMLayer(in_features=8, hidden=16, seed=7),
+    tensorc.FlattenLayer(),
+    tensorc.DenseLayer(seq_len * 16, clases, seed=8),
+])
+clasificador = tensorc.TensorCClassifier(model=modelo, epochs=20,
+                                          batch_size=32)
+clasificador.fit(X_train, y_train)  # X_train: [N, seq_len, 8]
+```
+
+Para un Transformer, usa `TransformerBlock(model_dim=64, ff_dim=128, heads=4)`
+en lugar de LSTM, y ajusta la última Dense a `seq_len * 64` entradas. Su entrada
+y salida también son batch-first: `[N, seq_len, model_dim]`. El forward,
+autograd, Adam, minibatches y predicción usan la ruta nativa C de Sequential.
+
 ### Entrenamiento de alto nivel con Model
 
 ```python
@@ -258,11 +282,11 @@ sdist y las ruedas multiplataforma, ejecuta una prueba de humo en cada
 rueda y publica todo en PyPI automáticamente. Para publicar una versión:
 
 ```sh
-# 1. Actualiza la versión en CMakeLists.txt, include/tensorc/tensorc.h,
-#    python/pyproject.toml y python/tensorc/__init__.py
+# 1. Actualiza CMakeLists.txt, ambos headers tensorc.h y los metadatos
+#    de versión en python/pyproject.toml y python/tensorc/__init__.py
 # 2. Ejecuta bash python/sync_core.sh tras cambiar el núcleo C
 # 3. Etiqueta y sube:
-git tag v0.16.0 && git push origin v0.16.0
+git tag v0.17.0 && git push origin v0.17.0
 ```
 
 Para subir a mano (necesitas un token de PyPI):

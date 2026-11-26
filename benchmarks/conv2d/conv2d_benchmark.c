@@ -6,6 +6,9 @@
  * Uso:
  *   conv2d_benchmark input.bin kernel.bin N C H W K KH KW SH SW PH PW reps
  *
+ * Cada muestra sincroniza el resultado para incluir la ejecución asíncrona
+ * del backend Metal en el tiempo reportado.
+ *
  * Salida (parseable):
  *   FORWARD_MS_MIN <ms>
  *   FORWARD_MS_MEDIAN <ms>
@@ -112,7 +115,11 @@ int main(int argc, char **argv) {
     /* Calentamiento: una pasada hacia adelante y hacia atrás. */
     tc_tensor_nd *warm = tc_tensor_nd_conv2d_ex(input, kernel, options);
     tc_tensor_nd *warm_loss = warm ? tc_tensor_nd_sum(warm) : NULL;
-    if (warm_loss) tc_tensor_nd_backward(warm_loss);
+    if (warm_loss) {
+        tc_tensor_nd_backward(warm_loss);
+        tc_tensor_nd_grad(input);
+        tc_tensor_nd_grad(kernel);
+    }
 
     /* Volcar la salida para que el script NumPy verifique la exactitud. */
     FILE *dump = fopen("c_output.bin", "wb");
@@ -127,6 +134,15 @@ int main(int argc, char **argv) {
     for (size_t r = 0; r < reps; ++r) {
         const double start = now_ms();
         tc_tensor_nd *output = tc_tensor_nd_conv2d_ex(input, kernel, options);
+        if (!output || !tc_tensor_nd_const_data(output)) {
+            fprintf(stderr, "forward falló\n");
+            tc_tensor_nd_free(output);
+            free(forward_ms);
+            free(backward_ms);
+            tc_tensor_nd_free(kernel);
+            tc_tensor_nd_free(input);
+            return 2;
+        }
         forward_ms[r] = now_ms() - start;
         tc_tensor_nd_free(output);
     }
@@ -138,6 +154,10 @@ int main(int argc, char **argv) {
         const double start = now_ms();
         if (!tc_tensor_nd_backward(loss)) {
             fprintf(stderr, "backward falló\n");
+            break;
+        }
+        if (!tc_tensor_nd_grad(input) || !tc_tensor_nd_grad(kernel)) {
+            fprintf(stderr, "sincronización backward falló\n");
             break;
         }
         backward_ms[r] = now_ms() - start;

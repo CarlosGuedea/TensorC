@@ -29,7 +29,7 @@ from .model import Model
 from .rl import DQNAgent
 from .sklearn import TensorCClassifier
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 __all__ = [
     "Tensor",

@@ -117,7 +117,7 @@ python -c "import tensorc; print(tensorc.__version__)"
 La versión esperada es:
 
 ~~~text
-0.16.0
+0.17.0
 ~~~
 
 Prueba también una operación con autodiferenciación:

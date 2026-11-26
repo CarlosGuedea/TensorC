@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.17.0 — Sequential para LSTM y Transformer
+
+- `Sequential` y su clasificador nativo C aceptan `LSTMLayer` y `TransformerBlock`; sus parámetros se entrenan con Adam en C y admiten clasificación de entradas batch-first con `FlattenLayer` y Dense final.
+- En Apple con Accelerate, el backward de Conv2D usa la ruta im2col+GEMM en CPU; el benchmark ahora sincroniza Metal para medir el trabajo completado.
+
 ## 0.16.0 — backend Metal opcional
 
 - Nuevo backend opcional Apple Metal para operaciones de tensores en macOS; las operaciones no soportadas siguen en CPU y `tensorc.metal_available()` indica si se activó.

@@ -1675,6 +1675,17 @@ static int conv2d_accelerate_backward(tc_tensor_nd *input, tc_tensor_nd *kernel,
             for (size_t k = 0; k < depth; ++k)
                 kernel->grad[f * depth + k] += dw[k * filters + f];
 
+#if defined(TENSORC_HAS_CUDA) || defined(TENSORC_HAS_METAL)
+    if (input->requires_grad && input->grad) {
+        input->host_grad_valid = 1;
+        input->dev_grad_valid = 0;
+    }
+    if (kernel->requires_grad && kernel->grad) {
+        kernel->host_grad_valid = 1;
+        kernel->dev_grad_valid = 0;
+    }
+#endif
+
     free(dcol);
     free(dw);
     free(col);
@@ -1744,6 +1755,10 @@ static int nd_device_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
     switch (tensor->op) {
         case TC_ND_OP_CONV2D: {
 #ifdef TENSORC_HAS_METAL
+#ifdef TENSORC_HAS_ACCELERATE
+            /* shortcut: Conv2D backward Metal es más lento que Accelerate en los benchmarks medidos; usa Metal cuando no existe Accelerate. */
+            return 0;
+#else
             const int want_x = a->requires_grad && a->grad;
             const int want_w = b->requires_grad && b->grad;
             if (!want_x && !want_w) return 1;
@@ -1762,6 +1777,7 @@ static int nd_device_backward_node(tc_tensor_nd *tensor, tc_tensor_nd *a,
             if (want_x) nd_device_produced_grad(a);
             if (want_w) nd_device_produced_grad(b);
             return 1;
+#endif
 #else
             return 0;
 #endif
